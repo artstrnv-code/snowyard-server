@@ -56,7 +56,20 @@ func (room *relayRoom) electLocked() {
 	}
 	s := room.state
 	ids := room.orderedPlayersLocked()
-	present := func(id uint64) bool { _, ok := room.peers[id]; return ok }
+	if room.rosterEnabled {
+		filtered := ids[:0]
+		for _, id := range ids {
+			p := room.peers[id]
+			if p != nil && !p.syncing && (room.rosterApplied == 0 || room.rosterMembers[id]) {
+				filtered = append(filtered, id)
+			}
+		}
+		ids = filtered
+	}
+	present := func(id uint64) bool {
+		_, ok := room.peers[id]
+		return ok && (!room.rosterEnabled || (!room.peers[id].syncing && (room.rosterApplied == 0 || room.rosterMembers[id])))
+	}
 	prev, oldBackup := s.coordinator, s.backup
 	if !present(s.coordinator) {
 		s.coordinator = 0
@@ -112,6 +125,9 @@ func (room *relayRoom) startRoyaleLocked() {
 	}
 	// Bot slots are reserved IDs, not server-side bot simulation.
 	room.broadcastLocked(serverMessage{Type: "match_started", Mode: room.mode, Room: room.name, Coordinator: s.coordinator, Backup: s.backup, BotSlots: s.botSlots, Slots: royaleSlots}, 0)
+	if room.rosterEnabled {
+		room.beginRosterLocked()
+	}
 }
 
 func (room *relayRoom) handleSessionLocked(p *peer, msg clientMessage) error {
@@ -121,16 +137,22 @@ func (room *relayRoom) handleSessionLocked(p *peer, msg clientMessage) error {
 	}
 	switch msg.Type {
 	case "coordinator_resume":
+		if room.rosterEnabled && room.barrier != nil {
+			return errors.New("cannot resume during a roster barrier")
+		}
 		if p.id != s.coordinator {
 			return errors.New("only coordinator may resume")
 		}
 		s.paused = false
 		room.broadcastLocked(serverMessage{Type: "session_resumed", Coordinator: s.coordinator}, 0)
 	case "bot_command":
-		if !room.royale() || !s.started || s.paused || p.id != s.coordinator {
+		if room.rosterEnabled && msg.Generation != room.rosterApplied {
+			return errors.New("bot command roster generation mismatch")
+		}
+		if !room.royale() || !s.started || s.paused || !room.isActiveLocked(p) || p.id != s.coordinator {
 			return errors.New("bot command not authorized")
 		}
-		if msg.BotID == 0 || msg.BotID > uint64(s.botSlots) || msg.Tick == 0 || len(msg.Payload) == 0 || len(msg.Payload) > maxPayloadBytes || !jsonValid(msg.Payload) {
+		if msg.BotID == 0 || msg.BotID > uint64(s.botSlots) || msg.Tick == 0 || (room.rosterEnabled && msg.Tick < room.rosterStartTick) || len(msg.Payload) == 0 || len(msg.Payload) > maxPayloadBytes || !jsonValid(msg.Payload) {
 			return errors.New("invalid bot command")
 		}
 		if s.botTicks == nil {
@@ -140,8 +162,11 @@ func (room *relayRoom) handleSessionLocked(p *peer, msg clientMessage) error {
 			return errors.New("non-monotonic bot command")
 		}
 		s.botTicks[msg.BotID] = msg.Tick
-		room.broadcastLocked(serverMessage{Type: "bot_command", PlayerID: p.id, BotID: msg.BotID, Tick: msg.Tick, Sequence: msg.Sequence, Payload: msg.Payload}, p.id)
+		room.broadcastLocked(serverMessage{Type: "bot_command", PlayerID: p.id, BotID: msg.BotID, Tick: msg.Tick, Sequence: msg.Sequence, Payload: msg.Payload, Generation: room.rosterApplied}, p.id)
 	case "hash_recheck":
+		if room.rosterEnabled && (!room.isActiveLocked(p) || msg.Generation != room.rosterApplied) {
+			return errors.New("hash recheck roster generation mismatch")
+		}
 		if p.syncing || msg.Tick == 0 || msg.Tick%room.hashInterval != 0 || len(msg.Hash) != 64 || !isHex(msg.Hash) {
 			return errors.New("invalid recheck hash")
 		}

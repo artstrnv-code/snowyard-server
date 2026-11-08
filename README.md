@@ -1,3 +1,5 @@
+**Version 0.3.2:** deterministic roster protocol (opt-in). See [PROTOCOL_032.md](PROTOCOL_032.md) and [RELEASE_NOTES_032.md](RELEASE_NOTES_032.md). Existing client protocol remains compatible.
+
 # Snowyard Relay Server 0.3.1 (Go 1.23)
 
 WebSocket relay, session coordinator and **opaque** world-snapshot transport for Snowyard. No external Go dependencies. The server does **not** simulate the map, bots, collisions, snow, or combat.

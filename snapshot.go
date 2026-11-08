@@ -170,7 +170,10 @@ func (room *relayRoom) appendJournalLocked(msg serverMessage) {
 
 }
 
-func journalCost(m serverMessage) int { return len(m.Payload) + 96 }
+func journalCost(m serverMessage) int {
+	// Membership events contain the roster, not a single command payload.
+	return len(m.Payload) + 96 + len(m.Players)*88
+}
 
 func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage) error {
 	if !room.persistent() || room.state == nil {
@@ -342,8 +345,14 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 			}
 		}
 		p.syncing = false
-		room.sendToLocked(p.id, serverMessage{Type: "sync_ready", SnapshotID: s.snapshot.Version, Cursor: s.nextEvent})
-		room.broadcastLocked(serverMessage{Type: "player_ready", PlayerID: p.id}, p.id)
+		if room.rosterEnabled {
+			room.sendToLocked(p.id, serverMessage{Type: "sync_loaded", SnapshotID: s.snapshot.Version, Cursor: s.nextEvent,
+				Message: "world loaded; wait for a roster commit before simulating"})
+			room.beginRosterLocked()
+		} else {
+			room.sendToLocked(p.id, serverMessage{Type: "sync_ready", SnapshotID: s.snapshot.Version, Cursor: s.nextEvent})
+			room.broadcastLocked(serverMessage{Type: "player_ready", PlayerID: p.id}, p.id)
+		}
 	default:
 		return fmt.Errorf("unsupported snapshot message %s", msg.Type)
 	}

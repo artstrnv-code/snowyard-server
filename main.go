@@ -31,54 +31,58 @@ type batchedCommand struct {
 }
 
 type clientMessage struct {
-	Type       string           `json:"type"`
-	Version    int              `json:"version,omitempty"`
-	Nickname   string           `json:"nickname,omitempty"`
-	Mode       string           `json:"mode,omitempty"`
-	Room       string           `json:"room,omitempty"`
-	Tick       uint64           `json:"tick,omitempty"`
-	Sequence   uint64           `json:"sequence,omitempty"`
-	Payload    json.RawMessage  `json:"payload,omitempty"`
-	Hash       string           `json:"hash,omitempty"`
-	Size       int              `json:"size,omitempty"`
-	Digest     string           `json:"digest,omitempty"`
-	Data       string           `json:"data,omitempty"`
-	Index      int              `json:"index,omitempty"`
-	SnapshotID uint64           `json:"snapshotId,omitempty"`
-	Cursor     uint64           `json:"cursor,omitempty"`
-	BotID      uint64           `json:"botId,omitempty"`
-	Commands   []batchedCommand `json:"commands,omitempty"`
+	Type          string           `json:"type"`
+	Version       int              `json:"version,omitempty"`
+	Nickname      string           `json:"nickname,omitempty"`
+	Mode          string           `json:"mode,omitempty"`
+	Room          string           `json:"room,omitempty"`
+	Tick          uint64           `json:"tick,omitempty"`
+	Sequence      uint64           `json:"sequence,omitempty"`
+	Payload       json.RawMessage  `json:"payload,omitempty"`
+	Hash          string           `json:"hash,omitempty"`
+	Size          int              `json:"size,omitempty"`
+	Digest        string           `json:"digest,omitempty"`
+	Data          string           `json:"data,omitempty"`
+	Index         int              `json:"index,omitempty"`
+	SnapshotID    uint64           `json:"snapshotId,omitempty"`
+	Cursor        uint64           `json:"cursor,omitempty"`
+	BotID         uint64           `json:"botId,omitempty"`
+	Commands      []batchedCommand `json:"commands,omitempty"`
+	RosterVersion int              `json:"rosterVersion,omitempty"`
+	Generation    uint64           `json:"generation,omitempty"`
 }
 
 type serverMessage struct {
-	Type         string           `json:"type"`
-	PlayerID     uint64           `json:"playerId,omitempty"`
-	Nickname     string           `json:"nickname,omitempty"`
-	Mode         string           `json:"mode,omitempty"`
-	Room         string           `json:"room,omitempty"`
-	Tick         uint64           `json:"tick,omitempty"`
-	Sequence     uint64           `json:"sequence,omitempty"`
-	Payload      json.RawMessage  `json:"payload,omitempty"`
-	Hash         string           `json:"hash,omitempty"`
-	Size         int              `json:"size,omitempty"`
-	Digest       string           `json:"digest,omitempty"`
-	Data         string           `json:"data,omitempty"`
-	Index        int              `json:"index,omitempty"`
-	Chunks       int              `json:"chunks,omitempty"`
-	SnapshotID   uint64           `json:"snapshotId,omitempty"`
-	Cursor       uint64           `json:"cursor,omitempty"`
-	Entries      []journalEntry   `json:"entries,omitempty"`
-	Coordinator  uint64           `json:"coordinator,omitempty"`
-	Backup       uint64           `json:"backup,omitempty"`
-	Paused       bool             `json:"paused,omitempty"`
-	BotSlots     int              `json:"botSlots,omitempty"`
-	Slots        int              `json:"slots,omitempty"`
-	BotID        uint64           `json:"botId,omitempty"`
-	Commands     []batchedCommand `json:"commands,omitempty"`
-	HashInterval uint64           `json:"hashInterval,omitempty"`
-	Message      string           `json:"message,omitempty"`
-	Players      []playerInfo     `json:"players,omitempty"`
-	Version      int              `json:"version,omitempty"`
+	Type          string           `json:"type"`
+	PlayerID      uint64           `json:"playerId,omitempty"`
+	Nickname      string           `json:"nickname,omitempty"`
+	Mode          string           `json:"mode,omitempty"`
+	Room          string           `json:"room,omitempty"`
+	Tick          uint64           `json:"tick,omitempty"`
+	Sequence      uint64           `json:"sequence,omitempty"`
+	Payload       json.RawMessage  `json:"payload,omitempty"`
+	Hash          string           `json:"hash,omitempty"`
+	Size          int              `json:"size,omitempty"`
+	Digest        string           `json:"digest,omitempty"`
+	Data          string           `json:"data,omitempty"`
+	Index         int              `json:"index,omitempty"`
+	Chunks        int              `json:"chunks,omitempty"`
+	SnapshotID    uint64           `json:"snapshotId,omitempty"`
+	Cursor        uint64           `json:"cursor,omitempty"`
+	Entries       []journalEntry   `json:"entries,omitempty"`
+	Coordinator   uint64           `json:"coordinator,omitempty"`
+	Backup        uint64           `json:"backup,omitempty"`
+	Paused        bool             `json:"paused,omitempty"`
+	BotSlots      int              `json:"botSlots,omitempty"`
+	Slots         int              `json:"slots,omitempty"`
+	BotID         uint64           `json:"botId,omitempty"`
+	Commands      []batchedCommand `json:"commands,omitempty"`
+	HashInterval  uint64           `json:"hashInterval,omitempty"`
+	RosterVersion int              `json:"rosterVersion,omitempty"`
+	Generation    uint64           `json:"generation,omitempty"`
+	Message       string           `json:"message,omitempty"`
+	Players       []playerInfo     `json:"players,omitempty"`
+	Version       int              `json:"version,omitempty"`
 }
 
 type playerInfo struct {
@@ -92,6 +96,7 @@ type peer struct {
 	socket          *wsConn
 	send            chan []byte
 	room            *relayRoom
+	rosterVersion   int
 	lastCommandTick uint64
 	lastSequence    uint64
 	lastHashTick    uint64
@@ -110,13 +115,19 @@ func (p *peer) stop() { p.once.Do(func() { close(p.done); p.socket.close() }) }
 // Rooms are isolated. A room owns its membership, ordering and transient hashes.
 // The hub mutex protects only room registration: gameplay never takes it.
 type relayRoom struct {
-	key          string
-	mode         string
-	name         string
-	mu           sync.Mutex
-	peers        map[uint64]*peer
-	state        *sessionState
-	hashInterval uint64
+	key              string
+	mode             string
+	name             string
+	mu               sync.Mutex
+	peers            map[uint64]*peer
+	state            *sessionState
+	hashInterval     uint64
+	rosterEnabled    bool
+	rosterMembers    map[uint64]bool
+	rosterGeneration uint64
+	rosterApplied    uint64
+	rosterStartTick  uint64
+	barrier          *rosterBarrier
 }
 type relay struct {
 	mu               sync.Mutex
@@ -196,6 +207,9 @@ func resolveRoom(mode, name string) (string, string, error) {
 	return mode, name, nil
 }
 func (r *relay) add(p *peer, mode, name string) error {
+	if p.rosterVersion == rosterProtocolVersion && mode != "brawl" && mode != "battle_royale" {
+		return errors.New("roster protocol requires an advanced mode")
+	}
 	// Load the persistent world outside the hub mutex, so Apps Script
 	// latency cannot delay joins to other rooms. Serialize only Brawl
 	// initialization, including recreation after the room becomes empty.
@@ -240,7 +254,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 		if len(r.rooms) >= maxRooms {
 			return errors.New("room capacity reached")
 		}
-		room = &relayRoom{key: key, mode: mode, name: name, peers: make(map[uint64]*peer), hashInterval: r.hashInterval}
+		room = &relayRoom{key: key, mode: mode, name: name, peers: make(map[uint64]*peer), hashInterval: r.hashInterval, rosterEnabled: p.rosterVersion == rosterProtocolVersion, rosterMembers: make(map[uint64]bool)}
 		if room.advanced() {
 			room.state = &sessionState{hashVotes: make(map[uint64]map[uint64]string), recheckVotes: make(map[uint64]map[uint64]string)}
 		}
@@ -251,6 +265,12 @@ func (r *relay) add(p *peer, mode, name string) error {
 	}
 	room.mu.Lock()
 	defer room.mu.Unlock()
+	if room.rosterEnabled != (p.rosterVersion == rosterProtocolVersion) {
+		return errors.New("mixed roster protocol versions in one room")
+	}
+	if room.rosterEnabled && !room.advanced() {
+		return errors.New("roster protocol requires an advanced room")
+	}
 	if r.total.Load() >= maxPeers {
 		return errors.New("relay capacity reached")
 	}
@@ -267,7 +287,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, Message: "relay v0.3: advanced clients required for room sync"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.2: advanced clients required for room sync"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -275,14 +295,20 @@ func (r *relay) add(p *peer, mode, name string) error {
 	}
 	room.peers[p.id] = p
 	r.total.Add(1)
-	room.broadcastLocked(serverMessage{Type: "player_joined", PlayerID: p.id, Nickname: p.nickname}, p.id)
+	if room.rosterEnabled {
+		room.broadcastLocked(serverMessage{Type: "player_waiting", PlayerID: p.id, Nickname: p.nickname}, p.id)
+	} else {
+		room.broadcastLocked(serverMessage{Type: "player_joined", PlayerID: p.id, Nickname: p.nickname}, p.id)
+	}
 	if room.advanced() {
 		room.electLocked()
 	}
 	if room.persistent() && p.syncing {
 		room.sendManifestLocked(p)
+	} else if room.rosterEnabled && !room.royale() {
+		room.beginRosterLocked()
 	}
-	if room.persistent() && len(room.peers) == 1 && room.state.snapshot == nil {
+	if room.persistent() && len(room.peers) == 1 && room.state.snapshot == nil && !room.rosterEnabled {
 		room.sendToLocked(p.id, serverMessage{Type: "snapshot_requested", Message: "bootstrap initial world from client"})
 	}
 	if room.persistent() && len(room.peers) == 1 {
@@ -309,6 +335,7 @@ func (r *relay) remove(p *peer) {
 		room.mu.Unlock()
 		return
 	}
+	wasActive := room.rosterMembers[p.id]
 	delete(room.peers, p.id)
 	if room.state != nil {
 		if room.state.uploading != nil && room.state.uploading.Owner == p.id {
@@ -322,9 +349,22 @@ func (r *relay) remove(p *peer) {
 		}
 	}
 	r.total.Add(-1)
-	room.broadcastLocked(serverMessage{Type: "player_left", PlayerID: p.id}, p.id)
-	if room.advanced() {
-		room.electLocked()
+	if room.rosterEnabled {
+		room.broadcastLocked(serverMessage{Type: "player_disconnected", PlayerID: p.id}, p.id)
+		delete(room.rosterMembers, p.id)
+		// Elect before creating the membership barrier so the coordinator
+		// handoff's mandatory pause survives the roster commit.
+		if room.advanced() {
+			room.electLocked()
+		}
+		if wasActive || room.barrier != nil {
+			room.beginRosterLocked()
+		}
+	} else {
+		room.broadcastLocked(serverMessage{Type: "player_left", PlayerID: p.id}, p.id)
+		if room.advanced() {
+			room.electLocked()
+		}
 	}
 	if room.state != nil && len(room.peers) == 0 {
 		if room.state.timer != nil {
@@ -379,32 +419,38 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		if len(msg.Payload) == 0 || len(msg.Payload) > maxPayloadBytes || !json.Valid(msg.Payload) {
 			return errors.New("invalid command payload")
 		}
-		p.lastCommandTick, p.lastSequence = msg.Tick, msg.Sequence
-		if p.syncing || p.leaving || (room.state != nil && room.state.paused) {
+		if p.syncing || p.leaving || !room.isActiveLocked(p) || (room.state != nil && room.state.paused) {
 			return errors.New("session not accepting commands")
 		}
-		cmd := serverMessage{Type: "command", PlayerID: p.id, Tick: msg.Tick, Sequence: msg.Sequence, Payload: msg.Payload}
+		if room.rosterEnabled && (msg.Generation != room.rosterApplied || msg.Tick < room.rosterStartTick) {
+			return errors.New("command roster generation or effective tick mismatch")
+		}
+		p.lastCommandTick, p.lastSequence = msg.Tick, msg.Sequence
+		cmd := serverMessage{Type: "command", PlayerID: p.id, Tick: msg.Tick, Sequence: msg.Sequence, Payload: msg.Payload, Generation: room.rosterApplied}
 		room.appendJournalLocked(cmd)
 		room.broadcastLocked(cmd, p.id)
 	case "command_batch":
-		if p.syncing || p.leaving || (room.state != nil && room.state.paused) {
+		if p.syncing || p.leaving || !room.isActiveLocked(p) || (room.state != nil && room.state.paused) {
 			return errors.New("session not accepting commands")
+		}
+		if room.rosterEnabled && msg.Generation != room.rosterApplied {
+			return errors.New("batch roster generation mismatch")
 		}
 		if len(msg.Commands) == 0 || len(msg.Commands) > 32 {
 			return errors.New("invalid command batch size")
 		}
 		lastTick, lastSeq := p.lastCommandTick, p.lastSequence
 		for _, c := range msg.Commands {
-			if c.Tick == 0 || c.Tick < lastTick || (c.Tick == lastTick && c.Sequence <= lastSeq) || len(c.Payload) == 0 || len(c.Payload) > maxPayloadBytes || !json.Valid(c.Payload) {
+			if c.Tick == 0 || (room.rosterEnabled && c.Tick < room.rosterStartTick) || c.Tick < lastTick || (c.Tick == lastTick && c.Sequence <= lastSeq) || len(c.Payload) == 0 || len(c.Payload) > maxPayloadBytes || !json.Valid(c.Payload) {
 				return errors.New("invalid command batch")
 			}
 			lastTick, lastSeq = c.Tick, c.Sequence
 		}
 		p.lastCommandTick, p.lastSequence = lastTick, lastSeq
 		for _, c := range msg.Commands {
-			room.appendJournalLocked(serverMessage{Type: "command", PlayerID: p.id, Tick: c.Tick, Sequence: c.Sequence, Payload: c.Payload})
+			room.appendJournalLocked(serverMessage{Type: "command", PlayerID: p.id, Tick: c.Tick, Sequence: c.Sequence, Payload: c.Payload, Generation: room.rosterApplied})
 		}
-		room.broadcastLocked(serverMessage{Type: "command_batch", PlayerID: p.id, Commands: msg.Commands}, p.id)
+		room.broadcastLocked(serverMessage{Type: "command_batch", PlayerID: p.id, Commands: msg.Commands, Generation: room.rosterApplied}, p.id)
 	case "leave_request":
 		if !room.persistent() || room.state == nil {
 			room.sendToLocked(p.id, serverMessage{Type: "leave_ready"})
@@ -424,16 +470,21 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		if msg.Tick == 0 || msg.Tick%period != 0 || msg.Tick <= p.lastHashTick || len(msg.Hash) != 64 || !isHex(msg.Hash) {
 			return errors.New("invalid hash checkpoint")
 		}
-		p.lastHashTick = msg.Tick
-		if p.syncing {
-			return errors.New("joiner cannot vote before synchronization")
+		if p.syncing || (room.rosterEnabled && !room.isActiveLocked(p)) {
+			return errors.New("player cannot vote before joining the active roster")
 		}
+		if room.rosterEnabled && (room.barrier != nil || msg.Generation != room.rosterApplied) {
+			return errors.New("hash roster generation mismatch or pending change")
+		}
+		p.lastHashTick = msg.Tick
 		// The server does not need to tally hashes: no consensus or repair is
 		// implemented. Forward opaque checkpoints to the room, nothing more.
-		room.broadcastLocked(serverMessage{Type: "hash", PlayerID: p.id, Tick: msg.Tick, Hash: msg.Hash}, p.id)
+		room.broadcastLocked(serverMessage{Type: "hash", PlayerID: p.id, Tick: msg.Tick, Hash: msg.Hash, Generation: room.rosterApplied}, p.id)
 		if room.advanced() {
 			room.acceptHashLocked(p.id, msg.Tick, msg.Hash, false)
 		}
+	case "roster_ready":
+		return room.handleRosterReadyLocked(p, msg)
 	case "coordinator_resume", "bot_command", "hash_recheck":
 		return room.handleSessionLocked(p, msg)
 	case "snapshot_begin", "snapshot_chunk", "snapshot_commit", "snapshot_info", "snapshot_get", "sync_poll", "sync_finish":
@@ -495,7 +546,11 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"invalid hello or protocol version"}`))
 		return
 	}
-	p := &peer{id: r.nextID.Add(1), nickname: hello.Nickname, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{})}
+	if hello.RosterVersion != 0 && hello.RosterVersion != rosterProtocolVersion {
+		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"unsupported roster protocol"}`))
+		return
+	}
+	p := &peer{id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{})}
 	mode, roomName, err := resolveRoom(hello.Mode, hello.Room)
 	if err == nil {
 		err = r.add(p, mode, roomName)
@@ -537,10 +592,10 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3\",\"players\":%d}", protocolVersion, hub.size())
+		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.2\",\"players\":%d}", protocolVersion, hub.size())
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.1 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.2 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }
