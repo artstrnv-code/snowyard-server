@@ -84,10 +84,16 @@ func headerHasToken(h http.Header, name, target string) bool {
 }
 
 func (w *wsConn) readMessage() ([]byte, error) {
+	return w.readMessageWithTimeout(75 * time.Second)
+}
+
+// New connections must identify themselves promptly so idle upgraded sockets
+// do not consume the free server's file descriptors for a full minute.
+func (w *wsConn) readMessageWithTimeout(timeout time.Duration) ([]byte, error) {
 	var output []byte
 	var fragmented bool
 	for {
-		_ = w.conn.SetReadDeadline(time.Now().Add(75 * time.Second))
+		_ = w.conn.SetReadDeadline(time.Now().Add(timeout))
 		header := make([]byte, 2)
 		if _, err := io.ReadFull(w.reader, header); err != nil {
 			return nil, err
@@ -180,12 +186,19 @@ func (w *wsConn) writeFrame(op byte, data []byte) error {
 	default:
 		hdr = append(hdr, 127, 0, 0, 0, 0, byte(len(data)>>24), byte(len(data)>>16), byte(len(data)>>8), byte(len(data)))
 	}
-	if _, err := w.conn.Write(hdr); err != nil {
-		return err
-	}
-	if len(data) > 0 {
-		_, err := w.conn.Write(data)
-		return err
+	// A single write avoids a split header/payload across kernel calls.
+	frame := make([]byte, len(hdr)+len(data))
+	copy(frame, hdr)
+	copy(frame[len(hdr):], data)
+	for len(frame) > 0 {
+		n, err := w.conn.Write(frame)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		frame = frame[n:]
 	}
 	return nil
 }

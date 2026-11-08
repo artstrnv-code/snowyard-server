@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -160,5 +161,142 @@ func TestInvalidHandshake(t *testing.T) {
 	got := s.receive(t)
 	if got.Type != "error" {
 		t.Fatalf("bad protocol accepted: %+v", got)
+	}
+}
+
+// Three players in one room must all receive the same command; a fourth player
+// in another room must not receive gameplay or membership events from it.
+func TestMultiPlayerRoomIsolation(t *testing.T) {
+	hub := newRelay()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", hub.websocket)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	host := strings.TrimPrefix(server.URL, "http://")
+	connect := func(nick, mode, room string) (*testSocket, serverMessage) {
+		s := connectTest(t, host)
+		s.send(t, clientMessage{Type: "hello", Version: 1, Nickname: nick, Mode: mode, Room: room})
+		w := s.receive(t)
+		if w.Type != "welcome" {
+			t.Fatalf("%s welcome: %+v", nick, w)
+		}
+		return s, w
+	}
+	a, aw := connect("A", "brawl", "game1")
+	b, bw := connect("B", "brawl", "game1")
+	if ev := a.receive(t); ev.Type != "player_joined" || ev.PlayerID != bw.PlayerID {
+		t.Fatalf("join B: %+v", ev)
+	}
+	c, cw := connect("C", "brawl", "game1")
+	if len(cw.Players) != 3 {
+		t.Fatalf("expected 3 player roster, got %+v", cw.Players)
+	}
+	for _, s := range []*testSocket{a, b} {
+		if ev := s.receive(t); ev.Type != "player_joined" || ev.PlayerID != cw.PlayerID {
+			t.Fatalf("join C: %+v", ev)
+		}
+	}
+	d, dw := connect("D", "brawl", "game2")
+	if len(dw.Players) != 1 {
+		t.Fatalf("cross-room roster: %+v", dw.Players)
+	}
+	a.send(t, clientMessage{Type: "command", Tick: 1, Sequence: 1, Payload: json.RawMessage(`{"move":1}`)})
+	for _, s := range []*testSocket{b, c} {
+		v := s.receive(t)
+		if v.Type != "command" || v.PlayerID != aw.PlayerID || v.Tick != 1 {
+			t.Fatalf("bad room command: %+v", v)
+		}
+	}
+	_ = d.c.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(d.r, header); err == nil {
+		t.Fatal("unrelated room received a command")
+	}
+	if hub.size() != 4 {
+		t.Fatalf("expected 4 players, got %d", hub.size())
+	}
+}
+
+func TestLegacyAndExplicitRoomsAreSeparate(t *testing.T) {
+	hub := newRelay()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", hub.websocket)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	host := strings.TrimPrefix(server.URL, "http://")
+	legacy := connectTest(t, host)
+	legacy.send(t, clientMessage{Type: "hello", Version: 1, Nickname: "Old client"})
+	lw := legacy.receive(t)
+	modern := connectTest(t, host)
+	modern.send(t, clientMessage{Type: "hello", Version: 1, Nickname: "New client", Mode: "brawl", Room: "global"})
+	mw := modern.receive(t)
+	if len(lw.Players) != 1 || len(mw.Players) != 1 || mw.Mode != "brawl" || mw.Room != "global" {
+		t.Fatalf("wrong room membership: legacy=%+v modern=%+v", lw, mw)
+	}
+}
+
+func TestResolveRoomValidation(t *testing.T) {
+	tests := []struct {
+		mode, room string
+		ok         bool
+	}{
+		{"", "", true}, {"brawl", "global", true}, {"battle_royale", "match-42", true},
+		{"", "global", false}, {"brawl", "", false}, {"legacy", "global", false},
+		{"brawl", "../bad", false}, {"brawl", "space bad", false},
+		{"brawl", "", false},
+	}
+	for _, tt := range tests {
+		_, _, err := resolveRoom(tt.mode, tt.room)
+		if (err == nil) != tt.ok {
+			t.Fatalf("resolveRoom(%q,%q) err=%v", tt.mode, tt.room, err)
+		}
+	}
+}
+
+func TestConcurrentRoomOperations(t *testing.T) {
+	hub := newRelay()
+	var wg sync.WaitGroup
+	for i := 0; i < 80; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p := &peer{id: hub.nextID.Add(1), nickname: "load", send: make(chan []byte, maxOutboundQueue)}
+			room := fmt.Sprintf("match%d", i%8)
+			if err := hub.add(p, "brawl", room); err != nil {
+				t.Errorf("add: %v", err)
+				return
+			}
+			hub.remove(p)
+		}(i)
+	}
+	wg.Wait()
+	if hub.size() != 0 {
+		t.Fatalf("peers leaked: %d", hub.size())
+	}
+	hub.mu.Lock()
+	n := len(hub.rooms)
+	hub.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("rooms leaked: %d", n)
+	}
+}
+
+// In-memory benchmark of the critical fan-out path. It deliberately excludes
+// socket/network latency and does not claim production capacity on Render.
+func BenchmarkRoomBroadcast16(b *testing.B) {
+	room := &relayRoom{peers: make(map[uint64]*peer)}
+	for i := 0; i < 16; i++ {
+		id := uint64(i + 1)
+		room.peers[id] = &peer{id: id, send: make(chan []byte, 1)}
+	}
+	msg := serverMessage{Type: "command", PlayerID: 1, Tick: 10, Sequence: 1, Payload: json.RawMessage(`{"x":1,"y":2}`)}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		room.broadcastLocked(msg, 1)
+		for id, p := range room.peers {
+			if id != 1 {
+				<-p.send
+			}
+		}
 	}
 }

@@ -1,6 +1,6 @@
 package main
 
-// Snowyard Relay Server 0.1: transport and coordination only.
+// Snowyard Relay Server 0.2: room-aware transport and coordination only.
 // The Java clients own all simulation, collisions, combat and world state.
 import (
 	"encoding/json"
@@ -9,7 +9,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,11 +22,14 @@ const maxPeers = 100
 const maxNicknameBytes = 72
 const maxPayloadBytes = 8 * 1024
 const maxOutboundQueue = 128
+const maxRooms = 256
 
 type clientMessage struct {
 	Type     string          `json:"type"`
 	Version  int             `json:"version,omitempty"`
 	Nickname string          `json:"nickname,omitempty"`
+	Mode     string          `json:"mode,omitempty"`
+	Room     string          `json:"room,omitempty"`
 	Tick     uint64          `json:"tick,omitempty"`
 	Sequence uint64          `json:"sequence,omitempty"`
 	Payload  json.RawMessage `json:"payload,omitempty"`
@@ -35,6 +40,8 @@ type serverMessage struct {
 	Type     string          `json:"type"`
 	PlayerID uint64          `json:"playerId,omitempty"`
 	Nickname string          `json:"nickname,omitempty"`
+	Mode     string          `json:"mode,omitempty"`
+	Room     string          `json:"room,omitempty"`
 	Tick     uint64          `json:"tick,omitempty"`
 	Sequence uint64          `json:"sequence,omitempty"`
 	Payload  json.RawMessage `json:"payload,omitempty"`
@@ -54,6 +61,7 @@ type peer struct {
 	nickname        string
 	socket          *wsConn
 	send            chan []byte
+	room            *relayRoom
 	lastCommandTick uint64
 	lastSequence    uint64
 	lastHashTick    uint64
@@ -63,62 +71,134 @@ type peer struct {
 
 func (p *peer) stop() { p.once.Do(func() { close(p.done); p.socket.close() }) }
 
-// A single mutex serializes room membership and message ordering.
-// The mutex is NEVER held during network I/O.
+// Rooms are isolated. A room owns its membership, ordering and transient hashes.
+// The hub mutex protects only room registration: gameplay never takes it.
+type relayRoom struct {
+	key   string
+	mode  string
+	name  string
+	mu    sync.Mutex
+	peers map[uint64]*peer
+}
 type relay struct {
 	mu     sync.Mutex
 	nextID atomic.Uint64
-	peers  map[uint64]*peer
-	hashes map[uint64]map[string]int
+	total  atomic.Int64
+	rooms  map[string]*relayRoom
 }
 
-func newRelay() *relay {
-	return &relay{peers: make(map[uint64]*peer), hashes: make(map[uint64]map[string]int)}
-}
-func (r *relay) size() int { r.mu.Lock(); defer r.mu.Unlock(); return len(r.peers) }
-func (r *relay) add(p *peer) ([]playerInfo, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.peers) >= maxPeers {
-		return nil, errors.New("brawl capacity reached")
+func newRelay() *relay     { return &relay{rooms: make(map[string]*relayRoom)} }
+func (r *relay) size() int { return int(r.total.Load()) }
+
+// Legacy clients omit both fields. They remain in their original shared room.
+// Future clients may choose an explicit mode/room (e.g. matchmaking-created ID).
+func validRoomPart(s string) bool {
+	if len(s) == 0 || len(s) > 48 {
+		return false
 	}
-	roster := make([]playerInfo, 0, len(r.peers)+1)
-	for _, other := range r.peers {
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+func resolveRoom(mode, name string) (string, string, error) {
+	if mode == "" && name == "" {
+		return "legacy", "global", nil
+	}
+	if mode == "" || name == "" || !validRoomPart(mode) || !validRoomPart(name) {
+		return "", "", errors.New("invalid mode or room")
+	}
+	// Reserved legacy namespace prevents an opt-in client from bypassing routing.
+	if strings.EqualFold(mode, "legacy") {
+		return "", "", errors.New("reserved mode")
+	}
+	return mode, name, nil
+}
+func (r *relay) add(p *peer, mode, name string) error {
+	key := mode + "/" + name
+	r.mu.Lock()
+	if r.total.Load() >= maxPeers {
+		r.mu.Unlock()
+		return errors.New("relay capacity reached")
+	}
+	room := r.rooms[key]
+	if room == nil {
+		if len(r.rooms) >= maxRooms {
+			r.mu.Unlock()
+			return errors.New("room capacity reached")
+		}
+		room = &relayRoom{key: key, mode: mode, name: name, peers: make(map[uint64]*peer)}
+		r.rooms[key] = room
+	}
+	room.mu.Lock()
+	if r.total.Load() >= maxPeers {
+		room.mu.Unlock()
+		r.mu.Unlock()
+		return errors.New("relay capacity reached")
+	}
+	roster := make([]playerInfo, 0, len(room.peers)+1)
+	for _, other := range room.peers {
 		roster = append(roster, playerInfo{other.id, other.nickname})
 	}
 	roster = append(roster, playerInfo{p.id, p.nickname})
-	r.peers[p.id] = p
-	r.broadcastLocked(serverMessage{Type: "player_joined", PlayerID: p.id, Nickname: p.nickname}, p.id)
-	return roster, nil
+	sort.Slice(roster, func(i, j int) bool { return roster[i].ID < roster[j].ID })
+	// Welcome is the FIRST queued message for a new peer, even under joins.
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, Message: "relay only: late join requires a future snapshot protocol"})
+	p.send <- wire
+	p.room = room
+	room.peers[p.id] = p
+	r.total.Add(1)
+	room.broadcastLocked(serverMessage{Type: "player_joined", PlayerID: p.id, Nickname: p.nickname}, p.id)
+	room.mu.Unlock()
+	r.mu.Unlock()
+	return nil
 }
 func (r *relay) remove(p *peer) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.peers[p.id] != p {
+	room := p.room
+	if room == nil {
 		return
 	}
-	delete(r.peers, p.id)
-	r.broadcastLocked(serverMessage{Type: "player_left", PlayerID: p.id}, p.id)
-	if len(r.peers) == 0 {
-		r.hashes = make(map[uint64]map[string]int)
+	room.mu.Lock()
+	if room.peers[p.id] != p {
+		room.mu.Unlock()
+		return
 	}
+	delete(room.peers, p.id)
+	r.total.Add(-1)
+	room.broadcastLocked(serverMessage{Type: "player_left", PlayerID: p.id}, p.id)
+	room.mu.Unlock()
+	// Lock order always hub -> room: safe against concurrent joins.
+	r.mu.Lock()
+	room.mu.Lock()
+	if len(room.peers) == 0 && r.rooms[room.key] == room {
+		delete(r.rooms, room.key)
+	}
+	room.mu.Unlock()
+	r.mu.Unlock()
 }
-func (r *relay) broadcastLocked(msg serverMessage, exclude uint64) {
-	wire, _ := json.Marshal(msg)
-	for id, p := range r.peers {
-		if id != exclude {
-			select {
-			case p.send <- wire:
-			default:
-				go p.stop()
-			}
+func (room *relayRoom) broadcastLocked(msg serverMessage, exclude uint64) {
+	wire, _ := json.Marshal(msg) // One serialization per broadcast, not per player.
+	for id, p := range room.peers {
+		if id == exclude {
+			continue
+		}
+		select {
+		case p.send <- wire:
+		default:
+			go p.stop()
 		}
 	}
 }
 func (r *relay) handle(p *peer, msg clientMessage) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.peers[p.id] != p {
+	room := p.room
+	if room == nil {
+		return errors.New("disconnected")
+	}
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	if room.peers[p.id] != p {
 		return errors.New("disconnected")
 	}
 	switch msg.Type {
@@ -129,29 +209,16 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		if len(msg.Payload) == 0 || len(msg.Payload) > maxPayloadBytes || !json.Valid(msg.Payload) {
 			return errors.New("invalid command payload")
 		}
-		// Payload is opaque to the server. Every receiver simulates it locally.
-		p.lastCommandTick = msg.Tick
-		p.lastSequence = msg.Sequence
-		r.broadcastLocked(serverMessage{Type: "command", PlayerID: p.id, Tick: msg.Tick, Sequence: msg.Sequence, Payload: msg.Payload}, p.id)
+		p.lastCommandTick, p.lastSequence = msg.Tick, msg.Sequence
+		room.broadcastLocked(serverMessage{Type: "command", PlayerID: p.id, Tick: msg.Tick, Sequence: msg.Sequence, Payload: msg.Payload}, p.id)
 	case "hash":
 		if msg.Tick == 0 || msg.Tick%8 != 0 || msg.Tick <= p.lastHashTick || len(msg.Hash) != 64 || !isHex(msg.Hash) {
 			return errors.New("invalid hash checkpoint")
 		}
 		p.lastHashTick = msg.Tick
-		counts := r.hashes[msg.Tick]
-		if counts == nil {
-			counts = make(map[string]int)
-			r.hashes[msg.Tick] = counts
-		}
-		counts[msg.Hash]++
-		// Forward hashes; this release does NOT claim majority consensus or repair.
-		r.broadcastLocked(serverMessage{Type: "hash", PlayerID: p.id, Tick: msg.Tick, Hash: msg.Hash}, p.id)
-		// Bound transient hash history. No world data retained in this release.
-		for tick := range r.hashes {
-			if tick+128 < msg.Tick {
-				delete(r.hashes, tick)
-			}
-		}
+		// The server does not need to tally hashes: no consensus or repair is
+		// implemented. Forward opaque checkpoints to the room, nothing more.
+		room.broadcastLocked(serverMessage{Type: "hash", PlayerID: p.id, Tick: msg.Tick, Hash: msg.Hash}, p.id)
 	default:
 		return errors.New("unknown message type")
 	}
@@ -200,7 +267,7 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 	}
 	defer socket.close()
 	// The first message must be a versioned hello; reject idle connections.
-	data, err := socket.readMessage()
+	data, err := socket.readMessageWithTimeout(15 * time.Second)
 	if err != nil {
 		return
 	}
@@ -210,14 +277,16 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	p := &peer{id: r.nextID.Add(1), nickname: hello.Nickname, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{})}
-	roster, err := r.add(p)
+	mode, roomName, err := resolveRoom(hello.Mode, hello.Room)
+	if err == nil {
+		err = r.add(p, mode, roomName)
+	}
 	if err != nil {
-		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"room full"}`))
+		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"invalid or full room"}`))
 		return
 	}
 	defer func() { r.remove(p); p.stop() }()
 	go writer(p)
-	sendControl(p, serverMessage{Type: "welcome", PlayerID: p.id, Version: protocolVersion, Players: roster, Message: "relay only: late join requires a future snapshot protocol"})
 	for {
 		message, err := socket.readMessage()
 		if err != nil {
@@ -253,6 +322,6 @@ func main() {
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.1 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.2 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }
