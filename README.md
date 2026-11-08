@@ -1,4 +1,4 @@
-# Snowyard Relay Server 0.3 (Go 1.23)
+# Snowyard Relay Server 0.3.1 (Go 1.23)
 
 WebSocket relay, session coordinator and **opaque** world-snapshot transport for Snowyard. No external Go dependencies. The server does **not** simulate the map, bots, collisions, snow, or combat.
 
@@ -11,12 +11,11 @@ WebSocket relay, session coordinator and **opaque** world-snapshot transport for
 - **Hash checkpoints**: new-mode rooms use a configurable interval (default 120 ticks). Disagreement requests a recheck. Persistent disagreement pauses the session until the coordinator resumes after client-side recovery. The relay does not judge simulation truth.
 - **Coordinator change**: elects the lowest-ID remaining participant (preferring the previous backup); a coordinator departure pauses the session for recovery. The Java client must handle the pause/resume protocol.
 - **Saving**: the coordinator periodically receives `snapshot_requested` (default 300 s). A graceful last-player `leave_request` also asks for a final snapshot. The relay validates snapshot size and SHA-256 before accepting it. After saving, it prompts the backup peer to cache a copy.
-- **Temporary storage**: `SnapshotStore` interface and atomic local-file implementation. This is **not permanent on Render Free**. A Google Sheets / Apps Script implementation will be supplied in a later release.
+- **Hybrid storage**: atomic local-file cache plus asynchronous Google Sheets / Apps Script API via `SnapshotStore`. Google Sheets is the durable destination; local Render files are temporary. Without Sheets environment settings, temporary-file mode remains available.
 - **Transport**: separate room locks, bounded outbound queues, JSON command batches (up to 32 individual commands per batch), snapshot blocks of at most 8192 decoded bytes. All commands are still delivered in room order.
 
 ## Not yet implemented
 
-- Google Sheets / Apps Script connection, retry and remote recovery.
 - Java client implementation of N-player gameplay, snapshot binary encoding and world restore.
 - Battle Royale game rules and actual bot AI (bots are coordinator-owned slots only).
 - Server-independent durable backups and automatic state reconciliation without client participation.
@@ -46,12 +45,24 @@ Environment:
 | `SNOWYARD_SNAPSHOT_DIR` | OS temporary directory + `/snowyard-relay` | Ephemeral snapshot file directory |
 | `SNOWYARD_SNAPSHOT_INTERVAL_SEC` | `300` | Periodic request, accepted range 30..3600 |
 | `SNOWYARD_HASH_INTERVAL_TICKS` | `120` | New-room checkpoint interval, accepted range 60..3600 |
+| `SNOWYARD_SHEETS_URL` | unset | Apps Script Web App HTTPS URL ending in `/exec` |
+| `SNOWYARD_SHEETS_TOKEN` | unset | Same secret as Script Property `SY_SERVER_TOKEN`; configure as Render secret |
 
-Important: the uploaded world snapshot has a 2 MiB limit and is **opaque** to the server. Google Sheets may impose different limits, so the future Apps Script adapter will partition Base64-encoded compressed data into multiple sheet cells. Snapshot format is not defined by this Go server.
+Important: the uploaded world snapshot has a 2 MiB limit and is **opaque** to the server. The Sheets API splits it into 8192-byte Base64 chunks, uploading or reading up to 16 chunks per request. The world binary format belongs to the future Java client.
+
+### Google Sheets deployment (0.3.1)
+
+1. Install the separate `Snowyard Google Sheets Macro 0.1`, run `setupWorldStorage` and deploy the Apps Script Web App. Copy the `/exec` URL.
+2. In Render > your service > Environment, set `SNOWYARD_SHEETS_URL` to that URL, and `SNOWYARD_SHEETS_TOKEN` to the **same** secret set in Apps Script Script Properties as `SY_SERVER_TOKEN`. Never put the secret in Git or in Java.
+3. Deploy Go Relay 0.3.1. The service continues to expose `/health` and `/ws` as before. The existing Java 0.11.1 only uses the legacy room and cannot create Brawl world snapshots yet.
+4. After the N-player client is implemented, its coordinator's `snapshot_commit` triggers immediate atomic local caching and a background upload to Sheets. Google can be slow without blocking the room lock. Log entry `[storage] cloud checkpoint committed` confirms a successful cloud save.
+5. When Brawl is next created, the server loads the newest valid local/cloud checkpoint, checking digest and tick. If Google is offline but a valid local file remains, play can continue; if **neither a verified local file nor an available cloud response** exists, the server refuses to initialize Brawl rather than silently overwrite an unknown persistent world.
+
+**Limits / risks**: The upload is queued in memory until completed, so process termination before `[storage] cloud checkpoint committed` can lose that checkpoint; Render Free local files are ephemeral. If an external write advanced the cloud world after this process loaded it, stale uploads can be rejected. The Cloud read on first Brawl join can take time, but other room joins are not blocked by its network call. Tests exercise an HTTPS mock of the macro; live Google deployment has not been exercised in this environment. Do not mistake a successful `snapshot_saved` relay message for a durable cloud commit.
 
 ## Protocol
 
-See [PROTOCOL_03.md](PROTOCOL_03.md) for messages, recovery rules and the integration contract for the Java client and future Apps Script adapter.
+See [PROTOCOL_03.md](PROTOCOL_03.md) for messages, recovery rules and the integration contract for the Java client and Apps Script adapter.
 
 ## Licence
 

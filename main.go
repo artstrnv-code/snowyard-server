@@ -124,6 +124,7 @@ type relay struct {
 	total            atomic.Int64
 	rooms            map[string]*relayRoom
 	store            SnapshotStore
+	worldInitMu      sync.Mutex
 	nextMatch        atomic.Uint64
 	snapshotInterval time.Duration
 	hashInterval     uint64
@@ -134,7 +135,20 @@ func newRelay() *relay {
 	if dir == "" {
 		dir = os.TempDir() + "/snowyard-relay"
 	}
-	return newRelayWithStore(newTempStore(dir))
+	local := newTempStore(dir)
+	endpoint := os.Getenv("SNOWYARD_SHEETS_URL")
+	token := os.Getenv("SNOWYARD_SHEETS_TOKEN")
+	if endpoint == "" && token == "" {
+		return newRelayWithStore(local)
+	}
+	if endpoint == "" || token == "" {
+		log.Fatal("both SNOWYARD_SHEETS_URL and SNOWYARD_SHEETS_TOKEN must be configured")
+	}
+	remote, err := newSheetsAPI(endpoint, token)
+	if err != nil {
+		log.Fatalf("invalid world storage configuration: %v", err)
+	}
+	return newRelayWithStore(newHybridStore(local, remote))
 }
 func newRelayWithStore(store SnapshotStore) *relay {
 	interval := 5 * time.Minute
@@ -182,6 +196,24 @@ func resolveRoom(mode, name string) (string, string, error) {
 	return mode, name, nil
 }
 func (r *relay) add(p *peer, mode, name string) error {
+	// Load the persistent world outside the hub mutex, so Apps Script
+	// latency cannot delay joins to other rooms. Serialize only Brawl
+	// initialization, including recreation after the room becomes empty.
+	var loaded *worldSnapshot
+	if mode == "brawl" && name == "global" {
+		r.worldInitMu.Lock()
+		defer r.worldInitMu.Unlock()
+		r.mu.Lock()
+		_, exists := r.rooms["brawl/global"]
+		r.mu.Unlock()
+		if !exists {
+			snapshot, err := r.store.Load()
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("cannot load saved world: %w", err)
+			}
+			loaded = snapshot
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.total.Load() >= maxPeers {
@@ -213,13 +245,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 			room.state = &sessionState{hashVotes: make(map[uint64]map[uint64]string), recheckVotes: make(map[uint64]map[uint64]string)}
 		}
 		if room.persistent() {
-			snapshot, err := r.store.Load()
-			if err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("cannot load saved world: %w", err)
-			}
-			if err == nil {
-				room.state.snapshot = snapshot
-			}
+			room.state.snapshot = loaded
 		}
 		r.rooms[key] = room
 	}
@@ -515,6 +541,6 @@ func main() {
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.1 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

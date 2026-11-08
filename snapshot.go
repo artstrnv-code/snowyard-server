@@ -354,5 +354,5 @@ func storageStatus(err error) string {
 	if err != nil {
 		return "memory_only: temporary disk save failed"
 	}
-	return "temporary_disk: Google Sheets adapter pending"
+	return "snapshot cached locally; cloud upload queued when configured"
 }
