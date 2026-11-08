@@ -166,6 +166,17 @@ func TestInvalidHandshake(t *testing.T) {
 
 // Three players in one room must all receive the same command; a fourth player
 // in another room must not receive gameplay or membership events from it.
+func receiveGameplayEvent(t *testing.T, s *testSocket) serverMessage {
+	t.Helper()
+	for i := 0; i < 8; i++ {
+		v := s.receive(t)
+		if v.Type != "coordinator_changed" {
+			return v
+		}
+	}
+	t.Fatal("unexpected repeated coordinator events")
+	return serverMessage{}
+}
 func TestMultiPlayerRoomIsolation(t *testing.T) {
 	hub := newRelay()
 	mux := http.NewServeMux()
@@ -176,7 +187,7 @@ func TestMultiPlayerRoomIsolation(t *testing.T) {
 	connect := func(nick, mode, room string) (*testSocket, serverMessage) {
 		s := connectTest(t, host)
 		s.send(t, clientMessage{Type: "hello", Version: 1, Nickname: nick, Mode: mode, Room: room})
-		w := s.receive(t)
+		w := receiveGameplayEvent(t, s)
 		if w.Type != "welcome" {
 			t.Fatalf("%s welcome: %+v", nick, w)
 		}
@@ -184,7 +195,7 @@ func TestMultiPlayerRoomIsolation(t *testing.T) {
 	}
 	a, aw := connect("A", "brawl", "game1")
 	b, bw := connect("B", "brawl", "game1")
-	if ev := a.receive(t); ev.Type != "player_joined" || ev.PlayerID != bw.PlayerID {
+	if ev := receiveGameplayEvent(t, a); ev.Type != "player_joined" || ev.PlayerID != bw.PlayerID {
 		t.Fatalf("join B: %+v", ev)
 	}
 	c, cw := connect("C", "brawl", "game1")
@@ -192,7 +203,7 @@ func TestMultiPlayerRoomIsolation(t *testing.T) {
 		t.Fatalf("expected 3 player roster, got %+v", cw.Players)
 	}
 	for _, s := range []*testSocket{a, b} {
-		if ev := s.receive(t); ev.Type != "player_joined" || ev.PlayerID != cw.PlayerID {
+		if ev := receiveGameplayEvent(t, s); ev.Type != "player_joined" || ev.PlayerID != cw.PlayerID {
 			t.Fatalf("join C: %+v", ev)
 		}
 	}
@@ -202,10 +213,13 @@ func TestMultiPlayerRoomIsolation(t *testing.T) {
 	}
 	a.send(t, clientMessage{Type: "command", Tick: 1, Sequence: 1, Payload: json.RawMessage(`{"move":1}`)})
 	for _, s := range []*testSocket{b, c} {
-		v := s.receive(t)
+		v := receiveGameplayEvent(t, s)
 		if v.Type != "command" || v.PlayerID != aw.PlayerID || v.Tick != 1 {
 			t.Fatalf("bad room command: %+v", v)
 		}
+	}
+	if ev := d.receive(t); ev.Type != "coordinator_changed" {
+		t.Fatalf("expected coordinator notice: %+v", ev)
 	}
 	_ = d.c.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
 	header := make([]byte, 2)
