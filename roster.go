@@ -28,6 +28,9 @@ type rosterBarrier struct {
 	reference    rosterVote
 	bootstrap    bool
 	targetPinned bool
+	// A new member must restore a fresh snapshot of the frozen voter state.
+	awaitingSnapshot bool
+	joinSnapshotID   uint64
 }
 
 // Called under room.mu. Participants are all synchronized connected peers,

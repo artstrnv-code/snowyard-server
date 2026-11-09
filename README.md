@@ -77,3 +77,12 @@ See [PROTOCOL_03.md](PROTOCOL_03.md) for messages, recovery rules and the integr
 ## Licence
 
 Follow the licence of the parent GitHub repository (GPLv3).
+
+
+## v0.3.4
+
+See `PROTOCOL_034.md` and `RELEASE_NOTES_034.md`. Java Snowyard 0.12i required for the fresh frozen roster-v2 checkpoint path.
+
+## v0.3.4a
+
+Correct /health version and explicit WebSocket welcome version; cancelled roster transactions resume established players. See RELEASE_NOTES_034a.md.

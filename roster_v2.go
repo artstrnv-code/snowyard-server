@@ -11,7 +11,7 @@ import (
 )
 
 const rosterProtocolV2 = 2
-const rosterBarrierTimeout = 20 * time.Second
+const rosterBarrierTimeout = 120 * time.Second
 
 type rosterPhase uint8
 
@@ -58,13 +58,10 @@ func (room *relayRoom) beginRosterV2Locked() {
 	}
 	room.rosterGeneration++
 	b := &rosterBarrier{generation: room.rosterGeneration, members: active, votes: make(map[uint64]rosterVote), wasPaused: room.state.paused, joining: joining, phase: rosterFreeze, deadline: time.Now().Add(rosterBarrierTimeout), bootstrap: bootstrap}
-	// Prefer a server-observed confirmed checkpoint, rather than allowing
-	// active clients to vote on unrelated current ticks. Clients may need
-	// to restore/replay to this exact point before acknowledging it.
-	if room.state.confirmedHash != "" && !bootstrap {
-		b.reference = rosterVote{tick: room.state.confirmedTick, hash: room.state.confirmedHash}
-		b.targetPinned = true
-	}
+	// Do not pin a historic hash checkpoint: active clients have no rollback
+	// history. They freeze at their current fully simulated tick and vote that
+	// state. A new joiner subsequently receives a fresh snapshot of THAT tick.
+
 	room.barrier = b
 	// Bounded server-side timeout: an unresponsive client cannot pause the
 	// whole courtyard forever. Its socket may still be healthy (ping/pong).
@@ -123,18 +120,43 @@ func (room *relayRoom) handleRosterReadyV2Locked(p *peer, msg clientMessage) err
 		b.reference = reference
 		b.phase = rosterJoinVerify
 		b.votes = make(map[uint64]rosterVote)
-		b.deadline = time.Now().Add(rosterBarrierTimeout)
 		if len(b.joining) == 0 {
 			room.commitRosterV2Locked()
 			return nil
 		}
-		// Only the first waiting joiner is admitted during this transaction.
-		// Other joiners are queued for a subsequent generation.
+		// Existing voting peers all confirmed the same state. A replayed old
+		// snapshot is NOT sufficient proof of a joiner's state: request fresh
+		// immutable bytes from the established coordinator at this exact tick.
 		b.joining = b.joining[:1]
-		room.sendToLocked(b.joining[0], serverMessage{Type: "roster_checkpoint", Generation: b.generation, Tick: reference.tick, Hash: reference.hash, Paused: true, Message: "verify your replayed world at exactly this tick, then send roster_join_ready"})
+		b.awaitingSnapshot = true
+		if room.state.coordinator == 0 || !containsPeerID(b.members, room.state.coordinator) {
+			room.abortRosterV2Locked("no active coordinator available for fresh roster checkpoint")
+			return nil
+		}
+		room.sendToLocked(room.state.coordinator, serverMessage{Type: "snapshot_requested",
+			Tick: reference.tick, Generation: b.generation,
+			Message: "roster v2 fresh frozen checkpoint required"})
+
 		return nil
 	}
 	return errors.New("expected roster_join_ready from the joining client")
+}
+
+// Called only after SHA-256-verified snapshot_commit under room.mu.
+// The joining client may have finished a preliminary replay already; send
+// a NEW manifest for the coordinator's exact frozen state.
+func (room *relayRoom) rosterSnapshotSavedV2Locked(owner, tick, version uint64) {
+	b := room.barrier
+	if b == nil || b.phase != rosterJoinVerify || !b.awaitingSnapshot ||
+		owner != room.state.coordinator || tick != b.reference.tick || len(b.joining) != 1 {
+		return
+	}
+	b.awaitingSnapshot = false
+	b.joinSnapshotID = version
+	if p := room.peers[b.joining[0]]; p != nil {
+		p.syncing = true
+		room.sendManifestLocked(p)
+	}
 }
 
 func (room *relayRoom) handleRosterJoinReadyV2Locked(p *peer, msg clientMessage) error {
@@ -146,7 +168,7 @@ func (room *relayRoom) handleRosterJoinReadyV2Locked(p *peer, msg clientMessage)
 		room.abortRosterV2Locked("join verification timed out")
 		return errors.New("join verification timed out")
 	}
-	if len(b.joining) != 1 || b.joining[0] != p.id || p.syncing {
+	if b.awaitingSnapshot || b.joinSnapshotID == 0 || len(b.joining) != 1 || b.joining[0] != p.id || p.syncing {
 		return errors.New("client is not the designated prepared joiner")
 	}
 	if msg.Tick != b.reference.tick || !strings.EqualFold(msg.Hash, b.reference.hash) {
@@ -210,18 +232,28 @@ func (room *relayRoom) abortRosterV2Locked(reason string) {
 		room.barrierTimer = nil
 	}
 	room.state.paused = b.wasPaused || room.rosterChangePending
-	// Joiners that missed the cut cannot silently remain in a live roster.
-	// Require a fresh snapshot before another attempt; active members resume
-	// only when no uncommitted leave is waiting.
-	for _, id := range b.joining {
-		if p := room.peers[id]; p != nil {
-			p.syncing = true
-			if room.persistent() {
-				room.sendManifestLocked(p)
+	// A failed transaction must not leave the established players frozen.
+	// Only committed roster members receive a resume; would-be joiners must
+	// reconnect explicitly, avoiding an infinite download/freeze retry loop.
+	for id, p := range room.peers {
+		if room.rosterMembers[id] {
+			room.sendToLocked(id, serverMessage{Type: "roster_aborted",
+				Generation: b.generation, Paused: room.state.paused, Message: reason})
+			if !room.state.paused {
+				room.sendToLocked(id, serverMessage{Type: "session_resumed",
+					Coordinator: room.state.coordinator,
+					Message:     "join cancelled; current players continue"})
 			}
+		} else {
+			// All uncommitted peers, including a queued P3, are excluded
+			// from voting and must explicitly reconnect after the failure.
+			p.syncing = true
+			room.sendToLocked(id, serverMessage{Type: "roster_aborted",
+				Generation: b.generation, Paused: true,
+				Message: reason + "; reconnect to retry"})
 		}
 	}
-	room.broadcastLocked(serverMessage{Type: "roster_aborted", Generation: b.generation, Paused: room.state.paused, Message: reason}, 0)
+
 }
 
 func containsPeerID(ids []uint64, id uint64) bool {

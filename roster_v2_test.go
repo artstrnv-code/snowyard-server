@@ -19,6 +19,14 @@ func v2peer(t *testing.T, r *relay, mode, name string) *peer {
 	}
 	return p
 }
+
+// Voting-unit tests use non-persistent rooms and isolate the roster layer.
+// Snapshot transfer is exercised separately with a real brawl/global room.
+func unitVerifiedJoin(b *rosterBarrier) {
+	b.awaitingSnapshot = false
+	b.joinSnapshotID = 1
+}
+
 func TestV2StagedJoinAndQueuedThirdPlayer(t *testing.T) {
 	r := newRelayWithStore(&mockStore{})
 	a := v2peer(t, r, "brawl", "testv2")
@@ -60,6 +68,7 @@ func TestV2StagedJoinAndQueuedThirdPlayer(t *testing.T) {
 	if err := r.handle(c, clientMessage{Type: "roster_join_ready", Generation: b.generation, Tick: 8, Hash: hash}); err == nil {
 		t.Fatal("wrong tick accepted")
 	}
+	unitVerifiedJoin(b)
 	if err := r.handle(c, clientMessage{Type: "roster_join_ready", Generation: b.generation, Tick: 7, Hash: hash}); err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +94,7 @@ func TestV2ActiveDisagreementCannotCommit(t *testing.T) {
 	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: gen, Tick: 4, Hash: h}); err != nil {
 		t.Fatal(err)
 	}
+	unitVerifiedJoin(a.room.barrier)
 	if err := r.handle(b, clientMessage{Type: "roster_join_ready", Generation: gen, Tick: 4, Hash: h}); err != nil {
 		t.Fatal(err)
 	}
@@ -156,6 +166,7 @@ func TestV2ActiveDepartureNeedsNewRosterCommit(t *testing.T) {
 	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: gen, Tick: 10, Hash: hash}); err != nil {
 		t.Fatal(err)
 	}
+	unitVerifiedJoin(a.room.barrier)
 	if err := r.handle(b, clientMessage{Type: "roster_join_ready", Generation: gen, Tick: 10, Hash: hash}); err != nil {
 		t.Fatal(err)
 	}
@@ -188,6 +199,7 @@ func TestV2RecoveryRequiresEveryActiveMemberAndValidSnapshot(t *testing.T) {
 	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: g, Tick: 11, Hash: h}); err != nil {
 		t.Fatal(err)
 	}
+	unitVerifiedJoin(a.room.barrier)
 	if err := r.handle(b, clientMessage{Type: "roster_join_ready", Generation: g, Tick: 11, Hash: h}); err != nil {
 		t.Fatal(err)
 	}
@@ -222,34 +234,223 @@ func TestV2RecoveryRequiresEveryActiveMemberAndValidSnapshot(t *testing.T) {
 	r.remove(a)
 }
 
-func TestV2PrepareUsesPinnedConfirmedCheckpoint(t *testing.T) {
+// A historic confirmed hash must never force a live peer to roll back.
+// For admission the relay votes at the frozen current tick and requires
+// a fresh snapshot of exactly that tick for the joiner.
+func TestV2PrepareDoesNotPinHistoricCheckpoint(t *testing.T) {
 	r := newRelayWithStore(&mockStore{})
 	a := v2peer(t, r, "brawl", "pinned")
 	h := strings.Repeat("a", 64)
 	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: 1, Hash: h}); err != nil {
 		t.Fatal(err)
 	}
-	// A solo player can attest its own checkpoint; the relay remembers it.
 	if err := r.handle(a, clientMessage{Type: "hash", Tick: 120, Hash: h, Generation: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if a.room.state.confirmedTick != 120 || a.room.state.confirmedHash != h {
-		t.Fatal("checkpoint not remembered")
+	if a.room.state.confirmedTick != 120 {
+		t.Fatal("no remembered historical tick")
 	}
 	b := v2peer(t, r, "brawl", "pinned")
 	barrier := a.room.barrier
-	if barrier == nil || !barrier.targetPinned || barrier.reference.tick != 120 {
-		t.Fatal("no pinned target")
+	if barrier == nil || barrier.targetPinned || barrier.reference.tick != 0 {
+		t.Fatal("historical tick incorrectly pinned")
 	}
-	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: barrier.generation, Tick: 121, Hash: h}); err == nil {
-		t.Fatal("wrong tick accepted")
-	}
-	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: barrier.generation, Tick: 120, Hash: h}); err != nil {
+	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: barrier.generation, Tick: 121, Hash: h}); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.handle(b, clientMessage{Type: "roster_join_ready", Generation: barrier.generation, Tick: 120, Hash: h}); err != nil {
+	if !barrier.awaitingSnapshot {
+		t.Fatal("new admission not waiting for fresh snapshot")
+	}
+	unitVerifiedJoin(barrier)
+	if err := r.handle(b, clientMessage{Type: "roster_join_ready", Generation: barrier.generation, Tick: 121, Hash: h}); err != nil {
 		t.Fatal(err)
 	}
 	r.remove(b)
 	r.remove(a)
+}
+
+func TestV2FreshSnapshotJoinEndToEndProtocol(t *testing.T) {
+	r := newRelayWithStore(&mockStore{})
+	a := v2peer(t, r, "brawl", "global")
+	h := strings.Repeat("c", 64)
+	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: 1, Tick: 0, Hash: h}); err != nil {
+		t.Fatal(err)
+	}
+	room := a.room
+	// Seed an older saved world. Byte semantics belong to Java, not Go.
+	old := []byte("opaque old snapshot")
+	oldHash := sha256.Sum256(old)
+	room.state.snapshot = &worldSnapshot{Tick: 1, Version: 1, Digest: hex.EncodeToString(oldHash[:]), Data: old}
+	room.state.snapshotCursor = room.state.nextEvent
+	b := v2peer(t, r, "brawl", "global")
+	if !b.syncing || room.barrier != nil {
+		t.Fatal("joining client voted before old snapshot replay")
+	}
+	if err := r.handle(b, clientMessage{Type: "snapshot_get", SnapshotID: 1, Index: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.handle(b, clientMessage{Type: "sync_poll", SnapshotID: 1, Cursor: room.state.snapshotCursor}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.handle(b, clientMessage{Type: "sync_finish", SnapshotID: 1, Cursor: room.state.nextEvent}); err != nil {
+		t.Fatal(err)
+	}
+	bar := room.barrier
+	if bar == nil || bar.phase != rosterFreeze {
+		t.Fatal("no established-cohort vote")
+	}
+	gen := bar.generation
+	drain(a)
+	drain(b)
+	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: gen, Tick: 7, Hash: h}); err != nil {
+		t.Fatal(err)
+	}
+	if bar.phase != rosterJoinVerify || !bar.awaitingSnapshot {
+		t.Fatal("no fresh checkpoint required")
+	}
+	if !containsType(drain(a), "snapshot_requested") {
+		t.Fatal("coordinator not asked for fresh frozen snapshot")
+	}
+	if containsType(drain(b), "roster_checkpoint") {
+		t.Fatal("joiner verified before fresh snapshot")
+	}
+	data := []byte("frozen state at tick seven")
+	digest := sha256.Sum256(data)
+	for _, msg := range []clientMessage{
+		{Type: "snapshot_begin", Tick: 7, Size: len(data), Digest: hex.EncodeToString(digest[:])},
+		{Type: "snapshot_chunk", Index: 0, Data: base64.StdEncoding.EncodeToString(data)},
+		{Type: "snapshot_commit"},
+	} {
+		if err := r.handle(a, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !b.syncing || bar.awaitingSnapshot || bar.joinSnapshotID != 2 {
+		t.Fatal("fresh state was not offered to joiner")
+	}
+	if !containsType(drain(b), "snapshot_manifest") {
+		t.Fatal("new snapshot manifest not sent")
+	}
+	if err := r.handle(b, clientMessage{Type: "snapshot_get", SnapshotID: 2, Index: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.handle(b, clientMessage{Type: "sync_poll", SnapshotID: 2, Cursor: room.state.snapshotCursor}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.handle(b, clientMessage{Type: "sync_finish", SnapshotID: 2, Cursor: room.state.nextEvent}); err != nil {
+		t.Fatal(err)
+	}
+	if !containsType(drain(b), "roster_checkpoint") {
+		t.Fatal("no dedicated checkpoint after verified download")
+	}
+	if err := r.handle(b, clientMessage{Type: "roster_join_ready", Generation: gen, Tick: 7, Hash: h}); err != nil {
+		t.Fatal(err)
+	}
+	if !room.rosterMembers[b.id] || room.barrier != nil {
+		t.Fatal("joined player not committed")
+	}
+	r.remove(b)
+	r.remove(a)
+}
+
+func TestV2FreshRosterCheckpointAllowsTickZero(t *testing.T) {
+	r := newRelayWithStore(&mockStore{})
+	a := v2peer(t, r, "brawl", "global")
+	h := strings.Repeat("b", 64)
+	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: 1, Tick: 0, Hash: h}); err != nil {
+		t.Fatal(err)
+	}
+	// A second player joins before any gameplay tick; bootstrap snapshot may
+	// genuinely be tick zero and must not be rejected as invalid metadata.
+	room := a.room
+	bytes := []byte("zero-tick brawl")
+	digest := sha256.Sum256(bytes)
+	room.state.snapshot = &worldSnapshot{Version: 1, Tick: 0, Digest: hex.EncodeToString(digest[:]), Data: bytes}
+	room.state.snapshotCursor = room.state.nextEvent
+	b := v2peer(t, r, "brawl", "global")
+	for _, msg := range []clientMessage{
+		{Type: "snapshot_get", SnapshotID: 1, Index: 0},
+		{Type: "sync_poll", SnapshotID: 1, Cursor: room.state.snapshotCursor},
+		{Type: "sync_finish", SnapshotID: 1, Cursor: room.state.nextEvent},
+	} {
+		if err := r.handle(b, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bar := room.barrier
+	if bar == nil {
+		t.Fatal("no barrier")
+	}
+	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: bar.generation, Tick: 0, Hash: h}); err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []clientMessage{
+		{Type: "snapshot_begin", Tick: 0, Size: len(bytes), Digest: hex.EncodeToString(digest[:])},
+		{Type: "snapshot_chunk", Index: 0, Data: base64.StdEncoding.EncodeToString(bytes)},
+		{Type: "snapshot_commit"},
+	} {
+		if err := r.handle(a, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if bar.awaitingSnapshot || bar.joinSnapshotID != 2 {
+		t.Fatal("zero-tick fresh snapshot rejected")
+	}
+	r.remove(b)
+	r.remove(a)
+}
+
+// A failed join must resume established players without immediately looping
+// into another barrier; the newcomer remains unadmitted until reconnect.
+func TestV2AbortedJoinResumesActiveAndDoesNotRetry(t *testing.T) {
+	r := newRelayWithStore(&mockStore{})
+	a := v2peer(t, r, "brawl", "abort-resume")
+	h := strings.Repeat("f", 64)
+	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: 1, Hash: h}); err != nil {
+		t.Fatal(err)
+	}
+	drain(a)
+	b := v2peer(t, r, "brawl", "abort-resume")
+	if a.room.barrier == nil {
+		t.Fatal("missing join transaction")
+	}
+	drain(a)
+	drain(b)
+	a.room.mu.Lock()
+	a.room.abortRosterV2Locked("test failed checkpoint")
+	stillPaused := a.room.state.paused
+	stillBarrier := a.room.barrier != nil
+	bSyncing := b.syncing
+	a.room.mu.Unlock()
+	if stillPaused || stillBarrier || !bSyncing {
+		t.Fatalf("stale state paused=%v barrier=%v syncing=%v", stillPaused, stillBarrier, bSyncing)
+	}
+	msgs := drain(a)
+	if !containsType(msgs, "roster_aborted") || !containsType(msgs, "session_resumed") {
+		t.Fatalf("active player not resumed: %+v", msgs)
+	}
+	if containsType(drain(b), "session_resumed") {
+		t.Fatal("joiner was incorrectly promoted/resumed")
+	}
+	r.remove(b)
+	r.remove(a)
+}
+
+func TestV2WelcomeIdentifiesServerBuild(t *testing.T) {
+	r := newRelayWithStore(&mockStore{})
+	p := v2peer(t, r, "brawl", "version")
+	msgs := drain(p)
+	found := false
+	for _, msg := range msgs {
+		if msg.Type == "welcome" {
+			found = true
+			if msg.ServerVersion != "0.3.4a" {
+				t.Fatalf("wrong build: %q", msg.ServerVersion)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("missing welcome")
+	}
+	r.remove(p)
 }

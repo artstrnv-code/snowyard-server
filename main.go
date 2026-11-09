@@ -53,6 +53,7 @@ type clientMessage struct {
 }
 
 type serverMessage struct {
+	ServerVersion string           `json:"serverVersion,omitempty"`
 	Type          string           `json:"type"`
 	PlayerID      uint64           `json:"playerId,omitempty"`
 	Nickname      string           `json:"nickname,omitempty"`
@@ -293,7 +294,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.3: advanced clients required for room sync"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.4a", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.4a: fresh checkpoint roster and version handshake"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -617,10 +618,10 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.3\",\"players\":%d}", protocolVersion, hub.size())
+		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.4a\",\"players\":%d}", protocolVersion, hub.size())
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.3 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.4a listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

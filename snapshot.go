@@ -191,8 +191,15 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 		if s.uploading != nil {
 			return errors.New("snapshot upload already in progress")
 		}
-		if msg.Size <= 0 || msg.Size > maxSnapshotBytes || !isDigest(msg.Digest) || msg.Tick == 0 {
+		if msg.Size <= 0 || msg.Size > maxSnapshotBytes || !isDigest(msg.Digest) ||
+			(msg.Tick == 0 && !(room.rosterProtocol == rosterProtocolV2 && room.barrier != nil && room.barrier.awaitingSnapshot && room.barrier.reference.tick == 0)) {
 			return errors.New("invalid snapshot metadata")
+		}
+		// During admission, the snapshot must represent the exact voted
+		// frozen world, never an arbitrary periodic/old checkpoint.
+		if b := room.barrier; room.rosterProtocol == rosterProtocolV2 && b != nil && b.awaitingSnapshot &&
+			(p.id != s.coordinator || msg.Tick != b.reference.tick) {
+			return errors.New("roster snapshot must match the active frozen vote")
 		}
 		if s.snapshot != nil && msg.Tick < s.snapshot.Tick {
 			return errors.New("stale snapshot")
@@ -238,9 +245,16 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 		// Journal is only safe relative to the new checkpoint. Drop entries
 		// through its tick, retaining later changes for catch-up.
 		kept := s.journal[:0]
-		for _, entry := range s.journal {
-			if entry.Command.Tick > v.Tick {
-				kept = append(kept, entry)
+		// The new roster begins at checkpoint tick+1. Commands submitted by
+		// the OLD generation beyond the freeze boundary must not be replayed
+		// into a joiner's fresh checkpoint (or leak into the new generation).
+		freshRoster := room.rosterProtocol == rosterProtocolV2 && room.barrier != nil &&
+			room.barrier.phase == rosterJoinVerify && room.barrier.awaitingSnapshot
+		if !freshRoster {
+			for _, entry := range s.journal {
+				if entry.Command.Tick > v.Tick {
+					kept = append(kept, entry)
+				}
 			}
 		}
 		for i := len(kept); i < len(s.journal); i++ {
@@ -258,8 +272,12 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 		if s.backup != 0 {
 			room.sendToLocked(s.backup, serverMessage{Type: "backup_snapshot_available", SnapshotID: v.Version, Digest: v.Digest, Tick: v.Tick})
 		}
+		// An admitted joiner must download this newly captured state, not
+		// merely confirm the older checkpoint used for preliminary catch-up.
+		room.rosterSnapshotSavedV2Locked(p.id, v.Tick, v.Version)
 		for _, other := range room.peers {
-			if other.syncing {
+			if other.syncing && (room.barrier == nil ||
+				len(room.barrier.joining) == 0 || other.id != room.barrier.joining[0]) {
 				room.sendManifestLocked(other)
 			}
 		}
@@ -365,7 +383,15 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 		if room.rosterEnabled {
 			room.sendToLocked(p.id, serverMessage{Type: "sync_loaded", SnapshotID: s.snapshot.Version, Cursor: s.nextEvent,
 				Message: "world loaded; wait for a roster commit before simulating"})
-			room.beginRosterLocked()
+			if b := room.barrier; room.rosterProtocol == rosterProtocolV2 && b != nil &&
+				b.phase == rosterJoinVerify && !b.awaitingSnapshot && b.joinSnapshotID == s.snapshot.Version &&
+				len(b.joining) == 1 && b.joining[0] == p.id {
+				room.sendToLocked(p.id, serverMessage{Type: "roster_checkpoint",
+					Generation: b.generation, Tick: b.reference.tick, Hash: b.reference.hash,
+					Paused: true, Message: "fresh frozen checkpoint loaded; verify and join"})
+			} else {
+				room.beginRosterLocked()
+			}
 		} else {
 			room.sendToLocked(p.id, serverMessage{Type: "sync_ready", SnapshotID: s.snapshot.Version, Cursor: s.nextEvent})
 			room.broadcastLocked(serverMessage{Type: "player_ready", PlayerID: p.id}, p.id)
