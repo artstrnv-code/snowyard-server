@@ -250,3 +250,57 @@ func TestPersistentRosterCommitAppearsInCatchupJournal(t *testing.T) {
 	r.remove(b)
 	r.remove(a)
 }
+
+// If the last active peer leaves while another is fetching its checkpoint,
+// the syncing peer cannot vote yet. A zero-member barrier must not be emitted.
+func TestNoEmptyRosterBarrierWhileOnlySyncingPeersRemain(t *testing.T) {
+	r := newRelayWithStore(&mockStore{})
+	a := rosterPeer(t, r, "brawl", "global")
+	readyRoster(t, r, a, a.room.barrier.generation, 0, strings.Repeat("a", 64))
+	room := a.room
+	// A checkpoint exists; next entrant must load it before joining.
+	room.mu.Lock()
+	room.state.snapshot = &worldSnapshot{Version: 1, Tick: 1, Data: []byte("checkpoint")}
+	room.state.snapshotCursor = room.state.nextEvent
+	room.mu.Unlock()
+	b := rosterPeer(t, r, "brawl", "global")
+	if !b.syncing {
+		t.Fatal("second player should still be downloading")
+	}
+	drain(b)
+	r.remove(a)
+	room.mu.Lock()
+	barrier := room.barrier
+	paused := room.state.paused
+	room.mu.Unlock()
+	if barrier != nil {
+		t.Fatal("empty roster barrier blocks joining peer forever")
+	}
+	if !paused {
+		t.Fatal("world should remain paused while no active peers exist")
+	}
+	for _, m := range drain(b) {
+		if m.Type == "roster_prepare" && len(m.Players) == 0 {
+			t.Fatal("server sent roster_prepare without participants")
+		}
+	}
+	// After sync finishes, participant becomes eligible for a normal barrier.
+	if err := r.handle(b, clientMessage{Type: "snapshot_get", SnapshotID: 1, Index: 0}); err != nil {
+		t.Fatal(err)
+	}
+	drain(b)
+	if err := r.handle(b, clientMessage{Type: "sync_poll", SnapshotID: 1, Cursor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	drain(b)
+	if err := r.handle(b, clientMessage{Type: "sync_finish", SnapshotID: 1, Cursor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	room.mu.Lock()
+	barrier = room.barrier
+	room.mu.Unlock()
+	if barrier == nil || len(barrier.members) != 1 || barrier.members[0] != b.id {
+		t.Fatal("sync_finish did not start valid single-player roster barrier")
+	}
+	r.remove(b)
+}

@@ -39,6 +39,15 @@ func (room *relayRoom) beginRosterLocked() {
 		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	// A room can temporarily contain only downloading peers after its last
+	// active participant leaves. There is no one eligible to vote yet. Do not
+	// broadcast a zero-member prepare (omitted players in JSON), and do not
+	// leave an impossible barrier behind. sync_finish will start a new barrier.
+	if len(ids) == 0 {
+		room.barrier = nil
+		room.state.paused = true
+		return
+	}
 	room.rosterGeneration++
 	pausedBefore := room.state.paused
 	if room.barrier != nil {
@@ -110,6 +119,15 @@ func (room *relayRoom) handleRosterReadyLocked(p *peer, msg clientMessage) error
 	}
 	room.rosterApplied = b.generation
 	room.rosterStartTick = first.tick + 1
+	// The roster barrier discards speculative commands beyond the confirmed
+	// simulation tick. Start monotonic validation afresh for the new generation;
+	// otherwise queued commands from the old generation can reject valid ticks.
+	for _, id := range b.members {
+		if member := room.peers[id]; member != nil {
+			member.lastCommandTick = first.tick
+			member.lastSequence = 0
+		}
+	}
 	room.barrier = nil
 	room.state.paused = b.wasPaused
 	room.electLocked()

@@ -128,6 +128,9 @@ type relayRoom struct {
 	rosterApplied    uint64
 	rosterStartTick  uint64
 	barrier          *rosterBarrier
+	// Freeze normal commands only at the final catch-up batch.
+	catchupOwner     uint64
+	catchupWasPaused bool
 }
 type relay struct {
 	mu               sync.Mutex
@@ -336,6 +339,15 @@ func (r *relay) remove(p *peer) {
 		return
 	}
 	wasActive := room.rosterMembers[p.id]
+	if room.catchupOwner == p.id {
+		room.catchupOwner = 0
+		if room.state != nil && room.barrier == nil {
+			room.state.paused = room.catchupWasPaused
+			if !room.state.paused {
+				room.broadcastLocked(serverMessage{Type: "session_resumed"}, 0)
+			}
+		}
+	}
 	delete(room.peers, p.id)
 	if room.state != nil {
 		if room.state.uploading != nil && room.state.uploading.Owner == p.id {

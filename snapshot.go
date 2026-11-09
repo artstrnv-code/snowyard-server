@@ -319,6 +319,17 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 					}
 				}
 			}
+			// When the replay reaches its tail, the active room must stop
+			// producing commands BEFORE the final batch is emitted. Otherwise
+			// sync_finish races against 60 new events per second and a joiner
+			// can never catch up, even with a fast connection.
+			if room.rosterEnabled && len(batch) < maxReplayBatch && room.catchupOwner == 0 {
+				room.catchupOwner = p.id
+				room.catchupWasPaused = s.paused
+				s.paused = true
+				room.broadcastLocked(serverMessage{Type: "session_paused", Paused: true,
+					Message: "Briefly freezing Brawl to complete a player's world replay"}, 0)
+			}
 			if len(batch) > 0 {
 				p.replayCursor = batch[len(batch)-1].Event
 			} else {
@@ -345,6 +356,12 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 			}
 		}
 		p.syncing = false
+		if room.catchupOwner == p.id {
+			// The upcoming membership barrier takes ownership of the pause;
+			// preserve any earlier coordinator-recovery pause across it.
+			s.paused = room.catchupWasPaused
+			room.catchupOwner = 0
+		}
 		if room.rosterEnabled {
 			room.sendToLocked(p.id, serverMessage{Type: "sync_loaded", SnapshotID: s.snapshot.Version, Cursor: s.nextEvent,
 				Message: "world loaded; wait for a roster commit before simulating"})
