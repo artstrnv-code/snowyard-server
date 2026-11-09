@@ -115,19 +115,22 @@ func (p *peer) stop() { p.once.Do(func() { close(p.done); p.socket.close() }) }
 // Rooms are isolated. A room owns its membership, ordering and transient hashes.
 // The hub mutex protects only room registration: gameplay never takes it.
 type relayRoom struct {
-	key              string
-	mode             string
-	name             string
-	mu               sync.Mutex
-	peers            map[uint64]*peer
-	state            *sessionState
-	hashInterval     uint64
-	rosterEnabled    bool
-	rosterMembers    map[uint64]bool
-	rosterGeneration uint64
-	rosterApplied    uint64
-	rosterStartTick  uint64
-	barrier          *rosterBarrier
+	key                 string
+	mode                string
+	name                string
+	mu                  sync.Mutex
+	peers               map[uint64]*peer
+	state               *sessionState
+	hashInterval        uint64
+	rosterEnabled       bool
+	rosterProtocol      int
+	rosterMembers       map[uint64]bool
+	rosterGeneration    uint64
+	rosterApplied       uint64
+	rosterStartTick     uint64
+	barrier             *rosterBarrier
+	barrierTimer        *time.Timer
+	rosterChangePending bool
 	// Freeze normal commands only at the final catch-up batch.
 	catchupOwner     uint64
 	catchupWasPaused bool
@@ -210,7 +213,7 @@ func resolveRoom(mode, name string) (string, string, error) {
 	return mode, name, nil
 }
 func (r *relay) add(p *peer, mode, name string) error {
-	if p.rosterVersion == rosterProtocolVersion && mode != "brawl" && mode != "battle_royale" {
+	if p.rosterVersion != 0 && mode != "brawl" && mode != "battle_royale" {
 		return errors.New("roster protocol requires an advanced mode")
 	}
 	// Load the persistent world outside the hub mutex, so Apps Script
@@ -257,7 +260,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 		if len(r.rooms) >= maxRooms {
 			return errors.New("room capacity reached")
 		}
-		room = &relayRoom{key: key, mode: mode, name: name, peers: make(map[uint64]*peer), hashInterval: r.hashInterval, rosterEnabled: p.rosterVersion == rosterProtocolVersion, rosterMembers: make(map[uint64]bool)}
+		room = &relayRoom{key: key, mode: mode, name: name, peers: make(map[uint64]*peer), hashInterval: r.hashInterval, rosterEnabled: p.rosterVersion != 0, rosterProtocol: p.rosterVersion, rosterMembers: make(map[uint64]bool)}
 		if room.advanced() {
 			room.state = &sessionState{hashVotes: make(map[uint64]map[uint64]string), recheckVotes: make(map[uint64]map[uint64]string)}
 		}
@@ -268,7 +271,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	}
 	room.mu.Lock()
 	defer room.mu.Unlock()
-	if room.rosterEnabled != (p.rosterVersion == rosterProtocolVersion) {
+	if room.rosterProtocol != p.rosterVersion {
 		return errors.New("mixed roster protocol versions in one room")
 	}
 	if room.rosterEnabled && !room.advanced() {
@@ -290,7 +293,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.2: advanced clients required for room sync"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.3: advanced clients required for room sync"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -364,12 +367,20 @@ func (r *relay) remove(p *peer) {
 	if room.rosterEnabled {
 		room.broadcastLocked(serverMessage{Type: "player_disconnected", PlayerID: p.id}, p.id)
 		delete(room.rosterMembers, p.id)
+		if wasActive && room.rosterProtocol == rosterProtocolV2 {
+			room.rosterChangePending = true
+		}
 		// Elect before creating the membership barrier so the coordinator
 		// handoff's mandatory pause survives the roster commit.
 		if room.advanced() {
 			room.electLocked()
 		}
-		if wasActive || room.barrier != nil {
+		if room.rosterProtocol == rosterProtocolV2 && room.barrier != nil {
+			room.abortRosterV2Locked("participant disconnected during roster verification")
+		}
+		if wasActive || room.rosterProtocol == rosterProtocolV2 {
+			room.beginRosterLocked()
+		} else if room.barrier != nil {
 			room.beginRosterLocked()
 		}
 	} else {
@@ -497,7 +508,9 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		}
 	case "roster_ready":
 		return room.handleRosterReadyLocked(p, msg)
-	case "coordinator_resume", "bot_command", "hash_recheck":
+	case "roster_join_ready":
+		return room.handleRosterJoinReadyV2Locked(p, msg)
+	case "coordinator_resume", "bot_command", "hash_recheck", "recovery_ready":
 		return room.handleSessionLocked(p, msg)
 	case "snapshot_begin", "snapshot_chunk", "snapshot_commit", "snapshot_info", "snapshot_get", "sync_poll", "sync_finish":
 		return r.handleSnapshotLocked(room, p, msg)
@@ -558,7 +571,7 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"invalid hello or protocol version"}`))
 		return
 	}
-	if hello.RosterVersion != 0 && hello.RosterVersion != rosterProtocolVersion {
+	if hello.RosterVersion != 0 && hello.RosterVersion != rosterProtocolVersion && hello.RosterVersion != rosterProtocolV2 {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"unsupported roster protocol"}`))
 		return
 	}
@@ -604,10 +617,10 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.2\",\"players\":%d}", protocolVersion, hub.size())
+		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.3\",\"players\":%d}", protocolVersion, hub.size())
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.2 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.3 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

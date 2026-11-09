@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -28,13 +29,19 @@ type sessionState struct {
 	hashVotes    map[uint64]map[uint64]string
 	recheckVotes map[uint64]map[uint64]string
 	// Persistence and catch-up apply ONLY to the official brawl/global world.
-	snapshot       *worldSnapshot
-	uploading      *snapshotUpload
-	journal        []journalEntry
-	journalBytes   int
-	nextEvent      uint64
-	snapshotCursor uint64
-	botTicks       map[uint64]uint64
+	snapshot         *worldSnapshot
+	uploading        *snapshotUpload
+	journal          []journalEntry
+	journalBytes     int
+	nextEvent        uint64
+	snapshotCursor   uint64
+	botTicks         map[uint64]uint64
+	recoveryRequired bool
+	recoveryTick     uint64
+	recoveryHash     string
+	recoveryVotes    map[uint64]bool
+	confirmedTick    uint64
+	confirmedHash    string
 }
 
 func (room *relayRoom) advanced() bool   { return room.mode == "brawl" || room.mode == "battle_royale" }
@@ -140,11 +147,40 @@ func (room *relayRoom) handleSessionLocked(p *peer, msg clientMessage) error {
 		if room.rosterEnabled && room.barrier != nil {
 			return errors.New("cannot resume during a roster barrier")
 		}
+		if room.rosterProtocol == rosterProtocolV2 && room.rosterChangePending {
+			return errors.New("cannot resume before the active departure is committed")
+		}
+		if room.rosterProtocol == rosterProtocolV2 && s.recoveryRequired {
+			return errors.New("cannot resume without verified world recovery")
+		}
 		if p.id != s.coordinator {
 			return errors.New("only coordinator may resume")
 		}
 		s.paused = false
 		room.broadcastLocked(serverMessage{Type: "session_resumed", Coordinator: s.coordinator}, 0)
+	case "recovery_ready":
+		if room.rosterProtocol != rosterProtocolV2 || !s.recoveryRequired || room.barrier != nil || !room.rosterMembers[p.id] || p.syncing {
+			return errors.New("not eligible for world recovery confirmation")
+		}
+		if msg.Tick != s.recoveryTick || !strings.EqualFold(msg.Hash, s.recoveryHash) || s.recoveryHash == "" {
+			return errors.New("recovery state does not match required checkpoint")
+		}
+		if s.snapshot == nil || msg.SnapshotID != s.snapshot.Version || msg.Tick < s.snapshot.Tick {
+			return errors.New("recovery snapshot version/tick mismatch")
+		}
+		if s.recoveryVotes == nil {
+			s.recoveryVotes = make(map[uint64]bool)
+		}
+		s.recoveryVotes[p.id] = true
+		for id := range room.rosterMembers {
+			if !s.recoveryVotes[id] {
+				return nil
+			}
+		}
+		s.recoveryRequired = false
+		s.recoveryVotes = nil
+		s.paused = false
+		room.broadcastLocked(serverMessage{Type: "session_resumed", Tick: s.recoveryTick, Hash: s.recoveryHash, SnapshotID: s.snapshot.Version, Message: "unanimous recovery confirmation"}, 0)
 	case "bot_command":
 		if room.rosterEnabled && msg.Generation != room.rosterApplied {
 			return errors.New("bot command roster generation mismatch")
@@ -198,22 +234,45 @@ func (room *relayRoom) acceptHashLocked(id, tick uint64, hash string, recheck bo
 		}
 	}
 	active := 0
-	for _, peer := range room.peers {
-		if !peer.syncing {
-			active++
+	if room.rosterProtocol == rosterProtocolV2 {
+		if !room.rosterMembers[id] || room.barrier != nil {
+			return
 		}
+		active = len(room.rosterMembers)
+	} else {
+		for _, peer := range room.peers {
+			if !peer.syncing {
+				active++
+			}
+		}
+	}
+	if active == 1 && room.rosterProtocol == rosterProtocolV2 && !recheck {
+		// With one player the server can record its checkpoint as the sole
+		// live authoritative declaration; it still cannot prove the physics.
+		if tick >= s.confirmedTick {
+			s.confirmedTick = tick
+			s.confirmedHash = hash
+		}
+		delete(votes, tick)
+		return
 	}
 	if len(votes[tick]) < active || active < 2 {
 		return
 	}
 	counts := make(map[string]int)
 	for peerID, h := range votes[tick] {
-		if _, ok := room.peers[peerID]; ok {
+		if _, ok := room.peers[peerID]; ok && (room.rosterProtocol != rosterProtocolV2 || room.rosterMembers[peerID]) {
 			counts[h]++
 		}
 	}
 	delete(votes, tick)
 	if len(counts) == 1 {
+		if room.rosterProtocol == rosterProtocolV2 && !recheck && tick >= s.confirmedTick {
+			s.confirmedTick = tick
+			for h := range counts {
+				s.confirmedHash = h
+			}
+		}
 		if recheck {
 			room.broadcastLocked(serverMessage{Type: "hash_verified", Tick: tick}, 0)
 		}
@@ -224,6 +283,13 @@ func (room *relayRoom) acceptHashLocked(id, tick uint64, hash string, recheck bo
 		return
 	}
 	s.paused = true
+	// Recovery requires explicit attestation by the stable membership; a
+	// coordinator_resume message is not sufficient for roster protocol v2.
+	if room.rosterProtocol == rosterProtocolV2 {
+		s.recoveryRequired = true
+		s.recoveryTick = tick
+		s.recoveryVotes = nil
+	}
 	// An explicit majority can identify the candidate reference hash; ties
 	// remain unresolved. The relay NEVER treats a hash as a world snapshot.
 	majorityHash := ""
@@ -231,6 +297,9 @@ func (room *relayRoom) acceptHashLocked(id, tick uint64, hash string, recheck bo
 		if n > active/2 {
 			majorityHash = h
 		}
+	}
+	if room.rosterProtocol == rosterProtocolV2 {
+		s.recoveryHash = majorityHash
 	}
 	room.broadcastLocked(serverMessage{Type: "session_paused", Tick: tick, Hash: majorityHash, Message: "repeated hash mismatch; require snapshot recovery"}, 0)
 	if s.coordinator != 0 {

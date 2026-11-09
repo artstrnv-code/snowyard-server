@@ -1,3 +1,7 @@
+# Snowyard Relay Server 0.3.3
+
+Новый протокол состава v2 реализован как opt-in. Спецификация: `PROTOCOL_033.md`; изменения: `RELEASE_NOTES_033.md`. Старый Java-клиент 0.12g остаётся на `rosterVersion=1` до его обновления.
+
 # Snowyard Relay 0.3.2c
 
 Replay catch-up fix: see RELEASE_NOTES_032c.md. Pair with Snowyard client 0.12g.

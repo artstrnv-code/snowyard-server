@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"time"
 )
 
 const rosterProtocolVersion = 1
@@ -17,15 +18,25 @@ type rosterVote struct {
 }
 
 type rosterBarrier struct {
-	generation uint64
-	members    []uint64
-	votes      map[uint64]rosterVote
-	wasPaused  bool
+	generation   uint64
+	members      []uint64
+	votes        map[uint64]rosterVote
+	wasPaused    bool
+	joining      []uint64
+	phase        rosterPhase
+	deadline     time.Time
+	reference    rosterVote
+	bootstrap    bool
+	targetPinned bool
 }
 
 // Called under room.mu. Participants are all synchronized connected peers,
 // including currently active players; newly connected syncing peers wait.
 func (room *relayRoom) beginRosterLocked() {
+	if room.rosterProtocol == rosterProtocolV2 {
+		room.beginRosterV2Locked()
+		return
+	}
 	if !room.rosterEnabled || room.state == nil {
 		return
 	}
@@ -73,6 +84,9 @@ func (room *relayRoom) rosterPlayersLocked(ids []uint64) []playerInfo {
 }
 
 func (room *relayRoom) handleRosterReadyLocked(p *peer, msg clientMessage) error {
+	if room.rosterProtocol == rosterProtocolV2 {
+		return room.handleRosterReadyV2Locked(p, msg)
+	}
 	if !room.rosterEnabled || room.barrier == nil {
 		return errors.New("no roster barrier in progress")
 	}
