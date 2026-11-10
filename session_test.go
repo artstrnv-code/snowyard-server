@@ -240,7 +240,7 @@ func TestHashMismatchRecheckThenPause(t *testing.T) {
 		p    *peer
 		hash string
 	}{{a, hashA}, {b, hashB}} {
-		if err := r.handle(v.p, clientMessage{Type: "hash", Tick: 120, Hash: v.hash}); err != nil {
+		if err := r.handle(v.p, clientMessage{Type: "hash", Tick: 88, Hash: v.hash}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -254,7 +254,7 @@ func TestHashMismatchRecheckThenPause(t *testing.T) {
 		p    *peer
 		hash string
 	}{{a, hashA}, {b, hashB}} {
-		if err := r.handle(v.p, clientMessage{Type: "hash_recheck", Tick: 120, Hash: v.hash}); err != nil {
+		if err := r.handle(v.p, clientMessage{Type: "hash_recheck", Tick: 88, Hash: v.hash}); err != nil {
 			t.Fatal(err)
 		}
 	}

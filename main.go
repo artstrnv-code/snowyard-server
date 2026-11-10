@@ -49,6 +49,7 @@ type clientMessage struct {
 	BotID         uint64           `json:"botId,omitempty"`
 	Commands      []batchedCommand `json:"commands,omitempty"`
 	RosterVersion int              `json:"rosterVersion,omitempty"`
+	Binary        bool             `json:"binary,omitempty"`
 	Generation    uint64           `json:"generation,omitempty"`
 }
 
@@ -99,6 +100,7 @@ type peer struct {
 	send            chan []byte
 	room            *relayRoom
 	rosterVersion   int
+	binary          bool
 	lastCommandTick uint64
 	lastSequence    uint64
 	lastHashTick    uint64
@@ -181,7 +183,7 @@ func newRelayWithStore(store SnapshotStore) *relay {
 			interval = time.Duration(n) * time.Second
 		}
 	}
-	hashInterval := uint64(120)
+	hashInterval := uint64(88)
 	if raw := os.Getenv("SNOWYARD_HASH_INTERVAL_TICKS"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err == nil && n >= 60 && n <= 3600 {
@@ -423,6 +425,10 @@ func (r *relay) remove(p *peer) {
 }
 func (room *relayRoom) broadcastLocked(msg serverMessage, exclude uint64) {
 	wire, _ := json.Marshal(msg) // One serialization per broadcast, not per player.
+	var binaryWire []byte
+	if msg.Type == "command_batch" {
+		binaryWire, _ = encodeServerBatch(msg)
+	}
 	gameplay := msg.Type == "command" || msg.Type == "command_batch" || msg.Type == "hash" || msg.Type == "bot_command"
 	for id, p := range room.peers {
 		if gameplay && p.syncing {
@@ -432,7 +438,12 @@ func (room *relayRoom) broadcastLocked(msg serverMessage, exclude uint64) {
 			continue
 		}
 		select {
-		case p.send <- wire:
+		case p.send <- func() []byte {
+			if p.binary && len(binaryWire) > 0 {
+				return binaryWire
+			}
+			return wire
+		}():
 		default:
 			go p.stop()
 		}
@@ -567,7 +578,11 @@ func writer(p *peer) {
 				return
 			}
 		case wire := <-p.send:
-			if err := p.socket.writeFrame(1, wire); err != nil {
+			opcode := byte(1)
+			if p.binary && len(wire) > 0 && wire[0] == serverBatchMarker {
+				opcode = 2
+			}
+			if err := p.socket.writeFrame(opcode, wire); err != nil {
 				return
 			}
 		}
@@ -601,7 +616,11 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"unsupported roster protocol"}`))
 		return
 	}
-	p := &peer{id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{})}
+	if hello.RosterVersion == rosterProtocolV3 && !hello.Binary {
+		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"Snowyard SYB2 client update required"}`))
+		return
+	}
+	p := &peer{id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, binary: hello.Binary, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{})}
 	mode, roomName, err := resolveRoom(hello.Mode, hello.Room)
 	if err == nil {
 		err = r.add(p, mode, roomName)
@@ -618,7 +637,16 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		var cmd clientMessage
-		if err = json.Unmarshal(message, &cmd); err != nil {
+		if len(message) > 0 && message[0] == clientBatchMarker {
+			if !p.binary {
+				sendControl(p, serverMessage{Type: "error", Message: "binary protocol not negotiated"})
+				continue
+			}
+			cmd, err = decodeClientBatch(message)
+		} else {
+			err = json.Unmarshal(message, &cmd)
+		}
+		if err != nil {
 			sendControl(p, serverMessage{Type: "error", Message: "invalid JSON"})
 			continue
 		}

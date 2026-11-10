@@ -1,7 +1,7 @@
 package main
 
 // Minimal RFC 6455 WebSocket transport for the Snowyard desktop relay.
-// Text messages only. Supports masked client frames, fragmentation, ping/pong,
+// Text and binary messages. Supports masked client frames, fragmentation, ping/pong,
 // close, limits and deadlines. No third-party dependencies.
 import (
 	"bufio"
@@ -150,7 +150,7 @@ func (w *wsConn) readMessageWithTimeout(timeout time.Duration) ([]byte, error) {
 			continue
 		case 0xA:
 			continue
-		case 0x1:
+		case 0x1, 0x2:
 			if fragmented {
 				return nil, errors.New("unexpected text frame")
 			}
@@ -168,7 +168,7 @@ func (w *wsConn) readMessageWithTimeout(timeout time.Duration) ([]byte, error) {
 				return output, nil
 			}
 		default:
-			return nil, errors.New("only text messages are supported")
+			return nil, errors.New("unsupported websocket data opcode")
 		}
 	}
 }

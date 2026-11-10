@@ -244,10 +244,10 @@ func TestV2PrepareDoesNotPinHistoricCheckpoint(t *testing.T) {
 	if err := r.handle(a, clientMessage{Type: "roster_ready", Generation: 1, Hash: h}); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.handle(a, clientMessage{Type: "hash", Tick: 120, Hash: h, Generation: 1}); err != nil {
+	if err := r.handle(a, clientMessage{Type: "hash", Tick: 88, Hash: h, Generation: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if a.room.state.confirmedTick != 120 {
+	if a.room.state.confirmedTick != 88 {
 		t.Fatal("no remembered historical tick")
 	}
 	b := v2peer(t, r, "brawl", "pinned")
