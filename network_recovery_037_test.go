@@ -3,7 +3,6 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"strings"
 	"testing"
 )
 
@@ -56,25 +55,29 @@ func v3RecoveryPeer(t *testing.T, r *relay) *peer {
 	return p
 }
 
-func TestV3DepartureCannotResumeWithoutRecovery(t *testing.T) {
+// A clean departure must publish a deterministic roster transition rather
+// than freeze the remaining player. Explicit recovery still guards rooms
+// which were already paused or had unverified state.
+func TestV3DepartureSchedulesDeterministicTransition(t *testing.T) {
 	r := newRelayWithStore(&mockStore{})
 	a := v3RecoveryPeer(t, r)
 	b := v3RecoveryPeer(t, r)
 	room := a.room
 	room.mu.Lock()
-	// An established two-person roster, not an in-progress join plan.
 	room.rosterMembers[b.id] = true
 	b.syncing = false
 	b.awaitingJoin = false
+	room.rosterApplied = 2
+	room.rosterGeneration = 2
 	room.state.coordinator = a.id
 	room.mu.Unlock()
 	drain(b)
 	r.remove(a)
-	if !room.state.paused || !room.state.recoveryRequired {
-		t.Fatal("departure did not block unsafe resume")
+	if room.state.paused || room.state.recoveryRequired {
+		t.Fatal("clean departure incorrectly froze the survivor")
 	}
-	if err := r.handle(b, clientMessage{Type: "coordinator_resume"}); err == nil || !strings.Contains(err.Error(), "recovery") {
-		t.Fatalf("unsafe resume accepted: %v", err)
+	if !containsType(drain(b), "roster_commit") {
+		t.Fatal("clean departure did not publish membership commit")
 	}
 	r.remove(b)
 }

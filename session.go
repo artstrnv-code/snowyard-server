@@ -97,9 +97,11 @@ func (room *relayRoom) electLocked() {
 		}
 	}
 	if prev != s.coordinator || oldBackup != s.backup {
-		if prev != 0 && prev != s.coordinator {
+		if prev != 0 && prev != s.coordinator && room.rosterProtocol != rosterProtocolV3 {
 			s.paused = true
 		}
+		// A roster-v3 departure has its own deterministic generation change.
+		// The departure handler pauses if a safe tick boundary cannot be formed.
 		room.broadcastLocked(serverMessage{Type: "coordinator_changed", Coordinator: s.coordinator, Backup: s.backup, Paused: s.paused}, 0)
 		if s.paused && s.coordinator != 0 {
 			room.sendToLocked(s.coordinator, serverMessage{Type: "resume_required", Message: "coordinator must confirm synchronized state"})

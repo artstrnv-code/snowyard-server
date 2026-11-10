@@ -196,6 +196,7 @@ func (room *relayRoom) handleJoinPlanReadyV3Locked(p *peer, msg clientMessage) e
 	room.v3Plan = nil
 	room.v3PriorGeneration = room.rosterApplied
 	room.v3EffectiveTick = b.effectiveTick
+	room.v3DepartureTick = 0
 	room.rosterMembers = make(map[uint64]bool, len(b.members))
 	for _, id := range b.members {
 		room.rosterMembers[id] = true
@@ -236,17 +237,84 @@ func (room *relayRoom) cancelV3PlanLocked(reason string) {
 	}
 }
 
+// A disconnect cannot be executed at WebSocket arrival time: the remaining
+// deterministic clients still need the departed actor's input for every tick
+// already submitted. The last command tick of the departing peer is the first
+// safe cutover boundary. On that tick the actor is removed by applyRoster().
+// A complicated in-flight join or an already damaged session falls back to
+// explicit recovery instead of publishing an unverifiable membership commit.
 func (room *relayRoom) handleDepartureV3Locked(p *peer, wasActive bool) {
 	if room.v3Plan != nil && containsPeerID(room.v3Plan.members, p.id) {
 		room.cancelV3PlanLocked("participant disconnected during join plan")
 	}
-	if wasActive && room.state != nil {
-		// An unexpected departure creates an unsatisfied lockstep input.
-		// Explicit recovery is safer than fabricating neutral commands.
-		room.state.paused = true
-		room.state.recoveryRequired = true
-		room.broadcastLocked(serverMessage{Type: "session_paused", Paused: true, Message: "active player disconnected; checkpoint recovery required"}, p.id)
+	if !wasActive || room.state == nil || len(room.rosterMembers) == 0 {
+		return
 	}
+	s := room.state
+	// The previous generation might still be due at a future tick. Do not
+	// attempt to stack a departure commit over an unapplied join transition.
+	pendingJoin := room.v3EffectiveTick != 0 && room.maxCommandTickV3Locked() < room.v3EffectiveTick
+	pendingDeparture := room.v3DepartureTick != 0 && room.maxCommandTickV3Locked() < room.v3DepartureTick
+	// A survivor that is more than the Java lockstep window behind cannot
+	// safely process this departure with the current bounded replay buffer.
+	const clientInputWindow = uint64(48)
+	tooFarBehind := false
+	for id := range room.rosterMembers {
+		if member := room.peers[id]; member != nil && p.lastCommandTick > member.lastCommandTick &&
+			p.lastCommandTick-member.lastCommandTick >= clientInputWindow {
+			tooFarBehind = true
+			break
+		}
+	}
+	if s.paused || s.recoveryRequired || p.lastCommandTick == ^uint64(0) || pendingJoin || pendingDeparture || tooFarBehind {
+		s.paused = true
+		s.recoveryRequired = true
+		room.broadcastLocked(serverMessage{Type: "session_paused", Paused: true,
+			Message: "active player disconnected; checkpoint recovery required"}, p.id)
+		return
+	}
+	cutover := p.lastCommandTick + 1
+	ids := make([]uint64, 0, len(room.rosterMembers))
+	for id := range room.rosterMembers {
+		if room.peers[id] != nil {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if len(ids) == 0 {
+		return
+	}
+	oldGeneration := room.rosterApplied
+	room.rosterGeneration++
+	room.rosterApplied = room.rosterGeneration
+	room.rosterStartTick = cutover
+	room.v3PriorGeneration = oldGeneration
+	room.v3EffectiveTick = cutover
+	room.v3DepartureTick = cutover
+	// Discard the monotonicity of any speculative old-generation input after
+	// the cutover. The clients will resubmit from the boundary in the new gen.
+	for _, id := range ids {
+		if member := room.peers[id]; member != nil && member.lastCommandTick >= cutover {
+			member.lastCommandTick = cutover - 1
+			member.lastSequence = 0
+		}
+	}
+	s.hashVotes = make(map[uint64]map[uint64]string)
+	s.recheckVotes = make(map[uint64]map[uint64]string)
+	commit := serverMessage{Type: "roster_commit", Generation: room.rosterApplied,
+		Tick: cutover, Players: room.rosterPlayersLocked(ids), Coordinator: s.coordinator,
+		Message: "deterministic player departure"}
+	room.appendJournalLocked(commit)
+	room.broadcastLocked(commit, 0)
+}
+
+// Old-generation command packets may already have been queued on the network
+// at the instant a departure commit is published. They cannot be applied in
+// the new generation and must not be reported as fatal protocol violations.
+func (room *relayRoom) staleDepartureInputV3Locked(generation, tick uint64) bool {
+	return room.rosterProtocol == rosterProtocolV3 && room.v3EffectiveTick != 0 &&
+		generation == room.v3PriorGeneration && tick >= room.v3EffectiveTick &&
+		room.v3DepartureTick == room.v3EffectiveTick
 }
 
 // The two generations overlap in transport time but never in simulated time.

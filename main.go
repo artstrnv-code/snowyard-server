@@ -137,6 +137,7 @@ type relayRoom struct {
 	v3Plan              *liveJoinPlan
 	v3PriorGeneration   uint64
 	v3EffectiveTick     uint64
+	v3DepartureTick     uint64
 	barrierTimer        *time.Timer
 	rosterChangePending bool
 	// Freeze normal commands only at the final catch-up batch.
@@ -304,7 +305,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.7", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.7: no-freeze live join protocol"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.8", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.8: deterministic departure transition"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -376,9 +377,6 @@ func (r *relay) remove(p *peer) {
 	}
 	r.total.Add(-1)
 	if room.rosterEnabled {
-		if room.rosterProtocol == rosterProtocolV3 {
-			room.handleDepartureV3Locked(p, wasActive)
-		}
 		room.broadcastLocked(serverMessage{Type: "player_disconnected", PlayerID: p.id}, p.id)
 		delete(room.rosterMembers, p.id)
 		if wasActive && room.rosterProtocol == rosterProtocolV2 {
@@ -388,6 +386,11 @@ func (r *relay) remove(p *peer) {
 		// handoff's mandatory pause survives the roster commit.
 		if room.advanced() {
 			room.electLocked()
+		}
+		if room.rosterProtocol == rosterProtocolV3 {
+			// Elect the new coordinator before publishing the deterministic
+			// departure commit so every peer receives the same authority ID.
+			room.handleDepartureV3Locked(p, wasActive)
 		}
 		if room.rosterProtocol == rosterProtocolV2 && room.barrier != nil {
 			room.abortRosterV2Locked("participant disconnected during roster verification")
@@ -461,6 +464,17 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 	}
 	switch msg.Type {
 	case "command":
+		if room.v3DepartureTick != 0 && msg.Generation == room.v3PriorGeneration &&
+			msg.Tick <= p.lastCommandTick {
+			// This was already accepted before the departure; the re-sent
+			// old-generation packet cannot change the replay journal.
+			return nil
+		}
+		if room.staleDepartureInputV3Locked(msg.Generation, msg.Tick) {
+			// Already sent on the old roster before the departure notification.
+			// Never turn a benign in-flight packet into a client-fatal error.
+			return nil
+		}
 		if msg.Tick == 0 || msg.Tick < p.lastCommandTick || (msg.Tick == p.lastCommandTick && msg.Sequence <= p.lastSequence) {
 			return errors.New("non-monotonic command tick or sequence")
 		}
@@ -479,6 +493,27 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		room.appendJournalLocked(cmd)
 		room.broadcastLocked(cmd, p.id)
 	case "command_batch":
+		if room.rosterProtocol == rosterProtocolV3 && room.v3DepartureTick != 0 &&
+			msg.Generation == room.v3PriorGeneration {
+			// A batch sent just before departure may straddle the cutover.
+			// Keep the old-generation prefix and drop only the obsolete tail.
+			keep := 0
+			for keep < len(msg.Commands) && msg.Commands[keep].Tick < room.v3DepartureTick {
+				keep++
+			}
+			msg.Commands = msg.Commands[:keep]
+			// The old-generation prefix may have already reached the relay.
+			// Only accept previously unseen ticks, preserving their order.
+			skip := 0
+			for skip < len(msg.Commands) && (msg.Commands[skip].Tick < p.lastCommandTick ||
+				(msg.Commands[skip].Tick == p.lastCommandTick && msg.Commands[skip].Sequence <= p.lastSequence)) {
+				skip++
+			}
+			msg.Commands = msg.Commands[skip:]
+			if len(msg.Commands) == 0 {
+				return nil
+			}
+		}
 		if p.syncing || p.leaving || !room.isActiveLocked(p) || (room.state != nil && room.state.paused) {
 			return errors.New("session not accepting commands")
 		}
@@ -513,6 +548,10 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 			room.sendToLocked(p.id, serverMessage{Type: "leave_ready"})
 		}
 	case "hash":
+		if room.staleDepartureInputV3Locked(msg.Generation, msg.Tick) {
+			// A hash of the retired roster is no longer meaningful.
+			return nil
+		}
 		period := uint64(8)
 		if room.advanced() {
 			period = room.hashInterval
@@ -675,6 +714,6 @@ func main() {
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.7 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.8 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }
