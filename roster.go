@@ -36,6 +36,10 @@ type rosterBarrier struct {
 // Called under room.mu. Participants are all synchronized connected peers,
 // including currently active players; newly connected syncing peers wait.
 func (room *relayRoom) beginRosterLocked() {
+	if room.rosterProtocol == rosterProtocolV3 {
+		room.bootstrapV3Locked()
+		return
+	}
 	if room.rosterProtocol == rosterProtocolV2 {
 		room.beginRosterV2Locked()
 		return

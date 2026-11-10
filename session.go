@@ -29,19 +29,20 @@ type sessionState struct {
 	hashVotes    map[uint64]map[uint64]string
 	recheckVotes map[uint64]map[uint64]string
 	// Persistence and catch-up apply ONLY to the official brawl/global world.
-	snapshot         *worldSnapshot
-	uploading        *snapshotUpload
-	journal          []journalEntry
-	journalBytes     int
-	nextEvent        uint64
-	snapshotCursor   uint64
-	botTicks         map[uint64]uint64
-	recoveryRequired bool
-	recoveryTick     uint64
-	recoveryHash     string
-	recoveryVotes    map[uint64]bool
-	confirmedTick    uint64
-	confirmedHash    string
+	snapshot           *worldSnapshot
+	uploading          *snapshotUpload
+	journal            []journalEntry
+	journalBytes       int
+	nextEvent          uint64
+	snapshotCursor     uint64
+	lastRefreshRequest time.Time
+	botTicks           map[uint64]uint64
+	recoveryRequired   bool
+	recoveryTick       uint64
+	recoveryHash       string
+	recoveryVotes      map[uint64]bool
+	confirmedTick      uint64
+	confirmedHash      string
 }
 
 func (room *relayRoom) advanced() bool   { return room.mode == "brawl" || room.mode == "battle_royale" }

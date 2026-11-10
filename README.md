@@ -1,3 +1,5 @@
+> **Current release: Relay 0.3.5.** For rosterVersion=3 live/no-freeze Brawl joins, see [PROTOCOL_035.md](PROTOCOL_035.md) and [RELEASE_NOTES_035.md](RELEASE_NOTES_035.md). Java 0.13a is required.
+
 # Snowyard Relay Server 0.3.3
 
 Новый протокол состава v2 реализован как opt-in. Спецификация: `PROTOCOL_033.md`; изменения: `RELEASE_NOTES_033.md`. Старый Java-клиент 0.12g остаётся на `rosterVersion=1` до его обновления.

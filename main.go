@@ -21,7 +21,7 @@ const protocolVersion = 1
 const maxPeers = 100
 const maxNicknameBytes = 72
 const maxPayloadBytes = 8 * 1024
-const maxOutboundQueue = 128
+const maxOutboundQueue = 256
 const maxRooms = 256
 
 type batchedCommand struct {
@@ -71,6 +71,7 @@ type serverMessage struct {
 	SnapshotID    uint64           `json:"snapshotId,omitempty"`
 	Cursor        uint64           `json:"cursor,omitempty"`
 	Entries       []journalEntry   `json:"entries,omitempty"`
+	More          bool             `json:"more,omitempty"`
 	Coordinator   uint64           `json:"coordinator,omitempty"`
 	Backup        uint64           `json:"backup,omitempty"`
 	Paused        bool             `json:"paused,omitempty"`
@@ -101,6 +102,7 @@ type peer struct {
 	lastCommandTick uint64
 	lastSequence    uint64
 	lastHashTick    uint64
+	awaitingJoin    bool
 	syncing         bool
 	leaving         bool
 	syncID          uint64
@@ -130,6 +132,9 @@ type relayRoom struct {
 	rosterApplied       uint64
 	rosterStartTick     uint64
 	barrier             *rosterBarrier
+	v3Plan              *liveJoinPlan
+	v3PriorGeneration   uint64
+	v3EffectiveTick     uint64
 	barrierTimer        *time.Timer
 	rosterChangePending bool
 	// Freeze normal commands only at the final catch-up batch.
@@ -214,6 +219,9 @@ func resolveRoom(mode, name string) (string, string, error) {
 	return mode, name, nil
 }
 func (r *relay) add(p *peer, mode, name string) error {
+	if p.rosterVersion == rosterProtocolV3 && (mode != "brawl" || name != "global") {
+		return errors.New("roster v3 is supported only in persistent global Brawl")
+	}
 	if p.rosterVersion != 0 && mode != "brawl" && mode != "battle_royale" {
 		return errors.New("roster protocol requires an advanced mode")
 	}
@@ -294,7 +302,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.4a", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.4a: fresh checkpoint roster and version handshake"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.5", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.5: no-freeze live join protocol"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -366,6 +374,9 @@ func (r *relay) remove(p *peer) {
 	}
 	r.total.Add(-1)
 	if room.rosterEnabled {
+		if room.rosterProtocol == rosterProtocolV3 {
+			room.handleDepartureV3Locked(p, wasActive)
+		}
 		room.broadcastLocked(serverMessage{Type: "player_disconnected", PlayerID: p.id}, p.id)
 		delete(room.rosterMembers, p.id)
 		if wasActive && room.rosterProtocol == rosterProtocolV2 {
@@ -379,7 +390,9 @@ func (r *relay) remove(p *peer) {
 		if room.rosterProtocol == rosterProtocolV2 && room.barrier != nil {
 			room.abortRosterV2Locked("participant disconnected during roster verification")
 		}
-		if wasActive || room.rosterProtocol == rosterProtocolV2 {
+		if room.rosterProtocol == rosterProtocolV3 {
+			// v3 departure recovery is handled separately, never start a freeze vote.
+		} else if wasActive || room.rosterProtocol == rosterProtocolV2 {
 			room.beginRosterLocked()
 		} else if room.barrier != nil {
 			room.beginRosterLocked()
@@ -446,18 +459,19 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		if p.syncing || p.leaving || !room.isActiveLocked(p) || (room.state != nil && room.state.paused) {
 			return errors.New("session not accepting commands")
 		}
-		if room.rosterEnabled && (msg.Generation != room.rosterApplied || msg.Tick < room.rosterStartTick) {
+		if room.rosterEnabled && !room.validInputGenerationLocked(msg.Generation, msg.Tick) {
 			return errors.New("command roster generation or effective tick mismatch")
 		}
+		room.guardJoinBoundaryV3Locked(msg.Tick)
 		p.lastCommandTick, p.lastSequence = msg.Tick, msg.Sequence
-		cmd := serverMessage{Type: "command", PlayerID: p.id, Tick: msg.Tick, Sequence: msg.Sequence, Payload: msg.Payload, Generation: room.rosterApplied}
+		cmd := serverMessage{Type: "command", PlayerID: p.id, Tick: msg.Tick, Sequence: msg.Sequence, Payload: msg.Payload, Generation: msg.Generation}
 		room.appendJournalLocked(cmd)
 		room.broadcastLocked(cmd, p.id)
 	case "command_batch":
 		if p.syncing || p.leaving || !room.isActiveLocked(p) || (room.state != nil && room.state.paused) {
 			return errors.New("session not accepting commands")
 		}
-		if room.rosterEnabled && msg.Generation != room.rosterApplied {
+		if room.rosterEnabled && room.rosterProtocol != rosterProtocolV3 && msg.Generation != room.rosterApplied {
 			return errors.New("batch roster generation mismatch")
 		}
 		if len(msg.Commands) == 0 || len(msg.Commands) > 32 {
@@ -465,16 +479,17 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		}
 		lastTick, lastSeq := p.lastCommandTick, p.lastSequence
 		for _, c := range msg.Commands {
-			if c.Tick == 0 || (room.rosterEnabled && c.Tick < room.rosterStartTick) || c.Tick < lastTick || (c.Tick == lastTick && c.Sequence <= lastSeq) || len(c.Payload) == 0 || len(c.Payload) > maxPayloadBytes || !json.Valid(c.Payload) {
+			if c.Tick == 0 || (room.rosterEnabled && !room.validInputGenerationLocked(msg.Generation, c.Tick)) || c.Tick < lastTick || (c.Tick == lastTick && c.Sequence <= lastSeq) || len(c.Payload) == 0 || len(c.Payload) > maxPayloadBytes || !json.Valid(c.Payload) {
 				return errors.New("invalid command batch")
 			}
 			lastTick, lastSeq = c.Tick, c.Sequence
 		}
+		room.guardJoinBoundaryV3Locked(lastTick)
 		p.lastCommandTick, p.lastSequence = lastTick, lastSeq
 		for _, c := range msg.Commands {
-			room.appendJournalLocked(serverMessage{Type: "command", PlayerID: p.id, Tick: c.Tick, Sequence: c.Sequence, Payload: c.Payload, Generation: room.rosterApplied})
+			room.appendJournalLocked(serverMessage{Type: "command", PlayerID: p.id, Tick: c.Tick, Sequence: c.Sequence, Payload: c.Payload, Generation: msg.Generation})
 		}
-		room.broadcastLocked(serverMessage{Type: "command_batch", PlayerID: p.id, Commands: msg.Commands, Generation: room.rosterApplied}, p.id)
+		room.broadcastLocked(serverMessage{Type: "command_batch", PlayerID: p.id, Commands: msg.Commands, Generation: msg.Generation}, p.id)
 	case "leave_request":
 		if !room.persistent() || room.state == nil {
 			room.sendToLocked(p.id, serverMessage{Type: "leave_ready"})
@@ -497,16 +512,26 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		if p.syncing || (room.rosterEnabled && !room.isActiveLocked(p)) {
 			return errors.New("player cannot vote before joining the active roster")
 		}
-		if room.rosterEnabled && (room.barrier != nil || msg.Generation != room.rosterApplied) {
+		if room.rosterEnabled && (room.barrier != nil || (msg.Generation != room.rosterApplied && !(room.rosterProtocol == rosterProtocolV3 && msg.Generation == room.v3PriorGeneration && msg.Tick < room.v3EffectiveTick))) {
 			return errors.New("hash roster generation mismatch or pending change")
 		}
 		p.lastHashTick = msg.Tick
 		// The server does not need to tally hashes: no consensus or repair is
 		// implemented. Forward opaque checkpoints to the room, nothing more.
-		room.broadcastLocked(serverMessage{Type: "hash", PlayerID: p.id, Tick: msg.Tick, Hash: msg.Hash, Generation: room.rosterApplied}, p.id)
-		if room.advanced() {
+		room.broadcastLocked(serverMessage{Type: "hash", PlayerID: p.id, Tick: msg.Tick, Hash: msg.Hash, Generation: msg.Generation}, p.id)
+		if room.advanced() && (room.rosterProtocol != rosterProtocolV3 || msg.Generation == room.rosterApplied) {
 			room.acceptHashLocked(p.id, msg.Tick, msg.Hash, false)
 		}
+	case "join_progress":
+		if room.rosterProtocol != rosterProtocolV3 {
+			return errors.New("join progress needs roster v3")
+		}
+		return room.handleJoinProgressV3Locked(p, msg)
+	case "join_plan_ready":
+		if room.rosterProtocol != rosterProtocolV3 {
+			return errors.New("join plan needs roster v3")
+		}
+		return room.handleJoinPlanReadyV3Locked(p, msg)
 	case "roster_ready":
 		return room.handleRosterReadyLocked(p, msg)
 	case "roster_join_ready":
@@ -572,7 +597,7 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"invalid hello or protocol version"}`))
 		return
 	}
-	if hello.RosterVersion != 0 && hello.RosterVersion != rosterProtocolVersion && hello.RosterVersion != rosterProtocolV2 {
+	if hello.RosterVersion != 0 && hello.RosterVersion != rosterProtocolVersion && hello.RosterVersion != rosterProtocolV2 && hello.RosterVersion != rosterProtocolV3 {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"unsupported roster protocol"}`))
 		return
 	}
@@ -618,10 +643,10 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.4a\",\"players\":%d}", protocolVersion, hub.size())
+		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.5\",\"players\":%d}", protocolVersion, hub.size())
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.4a listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.5 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

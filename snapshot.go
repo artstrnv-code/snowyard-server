@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -144,6 +145,13 @@ func (room *relayRoom) sendManifestLocked(p *peer) {
 		}
 		return
 	}
+	// A bounded journal may no longer cover a five-minute-old checkpoint.
+	// Never offer a snapshot that cannot be replayed to the live tail.
+	if room.rosterProtocol == rosterProtocolV3 && len(s.journal) > 0 && s.snapshotCursor+1 < s.journal[0].Event {
+		room.sendToLocked(p.id, serverMessage{Type: "sync_wait", Message: "refreshing old checkpoint: journal history expired"})
+		room.requestRefreshV3Locked()
+		return
+	}
 	v := s.snapshot
 	chunks := (len(v.Data) + snapshotChunkBytes - 1) / snapshotChunkBytes
 	p.syncID = v.Version
@@ -265,7 +273,15 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 		for _, entry := range kept {
 			s.journalBytes += journalCost(entry.Command)
 		}
-		if len(kept) > 0 {
+		if room.rosterProtocol == rosterProtocolV3 {
+			// Rebase post-checkpoint commands onto fresh journal IDs. A snapshot
+			// may be uploaded while inputs for future ticks are already queued.
+			// The old cursor cannot represent that snapshot boundary reliably.
+			for i := range s.journal {
+				s.nextEvent++
+				s.journal[i].Event = s.nextEvent
+			}
+		} else if len(kept) > 0 {
 			s.snapshotCursor = kept[0].Event - 1
 		}
 		room.broadcastLocked(serverMessage{Type: "snapshot_saved", Tick: v.Tick, Digest: v.Digest, SnapshotID: v.Version, Message: storageStatus(persistErr)}, 0)
@@ -325,23 +341,38 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 			return errors.New("invalid replay cursor")
 		}
 		if len(s.journal) > 0 && p.replayCursor+1 < s.journal[0].Event {
+			if room.rosterProtocol == rosterProtocolV3 {
+				room.sendToLocked(p.id, serverMessage{Type: "sync_wait", Message: "journal expired during transfer; requesting fresh snapshot"})
+				room.requestRefreshV3Locked()
+				return nil
+			}
 			return errors.New("command journal expired; request new snapshot")
 		}
 		for burst := 0; burst < maxReplayBurst; burst++ {
+			// Journal entries are strictly event-sorted; repeated full scans
+			// are wasteful when several peers catch up simultaneously.
+			first := sort.Search(len(s.journal), func(i int) bool {
+				return s.journal[i].Event > p.replayCursor
+			})
 			batch := make([]journalEntry, 0, maxReplayBatch)
-			for _, entry := range s.journal {
-				if entry.Event > p.replayCursor {
-					batch = append(batch, entry)
-					if len(batch) == maxReplayBatch {
+			end := first
+			budget := 0
+			for end < len(s.journal) && len(batch) < maxReplayBatch {
+				entry := s.journal[end]
+				// v3 must fit the Java WebSocket's 64 KiB frame guard.
+				// v1/v2 keep their exact legacy batch boundaries.
+				if room.rosterProtocol == rosterProtocolV3 {
+					cost := journalCost(entry.Command) + 160
+					if len(batch) > 0 && budget+cost > 40000 {
 						break
 					}
+					budget += cost
 				}
+				batch = append(batch, entry)
+				end++
 			}
-			// When the replay reaches its tail, the active room must stop
-			// producing commands BEFORE the final batch is emitted. Otherwise
-			// sync_finish races against 60 new events per second and a joiner
-			// can never catch up, even with a fast connection.
-			if room.rosterEnabled && len(batch) < maxReplayBatch && room.catchupOwner == 0 {
+			// v1/v2 retain their old brief freeze for compatibility only.
+			if room.rosterProtocol != rosterProtocolV3 && room.rosterEnabled && len(batch) < maxReplayBatch && room.catchupOwner == 0 {
 				room.catchupOwner = p.id
 				room.catchupWasPaused = s.paused
 				s.paused = true
@@ -353,17 +384,23 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 			} else {
 				p.replayCursor = s.nextEvent
 			}
-			room.sendToLocked(p.id, serverMessage{Type: "sync_batch", SnapshotID: s.snapshot.Version, Entries: batch, Cursor: p.replayCursor})
-			if len(batch) < maxReplayBatch {
+			more := end < len(s.journal)
+			room.sendToLocked(p.id, serverMessage{Type: "sync_batch", SnapshotID: s.snapshot.Version,
+				Entries: batch, Cursor: p.replayCursor, More: more})
+			if !more {
 				break
 			}
 		}
+
 	case "sync_finish":
 		if !p.syncing {
 			return nil
 		}
 		if s.snapshot == nil || msg.SnapshotID != s.snapshot.Version {
 			return errors.New("snapshot changed")
+		}
+		if room.rosterProtocol == rosterProtocolV3 {
+			return room.finishLiveReplayV3Locked(p, msg)
 		}
 		if msg.Cursor != s.nextEvent || p.replayCursor != s.nextEvent {
 			return errors.New("replay not caught up")
@@ -407,4 +444,17 @@ func storageStatus(err error) string {
 		return "memory_only: temporary disk save failed"
 	}
 	return "snapshot cached locally; cloud upload queued when configured"
+}
+
+// Throttle refresh requests to prevent dozens of simultaneous loading peers
+// from asking the coordinator to serialize the same world every frame.
+func (room *relayRoom) requestRefreshV3Locked() {
+	if room.state == nil || room.rosterProtocol != rosterProtocolV3 || room.state.coordinator == 0 || room.state.uploading != nil {
+		return
+	}
+	if time.Since(room.state.lastRefreshRequest) < 5*time.Second {
+		return
+	}
+	room.state.lastRefreshRequest = time.Now()
+	room.sendToLocked(room.state.coordinator, serverMessage{Type: "snapshot_requested", Message: "refresh checkpoint to cover expired live replay journal"})
 }
