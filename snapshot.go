@@ -188,6 +188,17 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 		return errors.New("snapshots only available in global brawl")
 	}
 	s := room.state
+	// A newer checkpoint can supersede a joiner's download/replay while
+	// old WebSocket requests are already in flight. These requests belong
+	// to the retired snapshot, not to the new transfer: ignore them rather
+	// than treating a normal refresh as a fatal protocol violation.
+	if p.syncing && s.snapshot != nil && p.syncID == s.snapshot.Version &&
+		msg.SnapshotID > 0 && msg.SnapshotID < p.syncID {
+		switch msg.Type {
+		case "snapshot_get", "sync_poll", "sync_finish":
+			return nil
+		}
+	}
 	switch msg.Type {
 	case "snapshot_begin":
 		if p.id != s.coordinator {
