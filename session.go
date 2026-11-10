@@ -151,7 +151,7 @@ func (room *relayRoom) handleSessionLocked(p *peer, msg clientMessage) error {
 		if room.rosterProtocol == rosterProtocolV2 && room.rosterChangePending {
 			return errors.New("cannot resume before the active departure is committed")
 		}
-		if room.rosterProtocol == rosterProtocolV2 && s.recoveryRequired {
+		if s.recoveryRequired {
 			return errors.New("cannot resume without verified world recovery")
 		}
 		if p.id != s.coordinator {

@@ -244,6 +244,7 @@ func (room *relayRoom) handleDepartureV3Locked(p *peer, wasActive bool) {
 		// An unexpected departure creates an unsatisfied lockstep input.
 		// Explicit recovery is safer than fabricating neutral commands.
 		room.state.paused = true
+		room.state.recoveryRequired = true
 		room.broadcastLocked(serverMessage{Type: "session_paused", Paused: true, Message: "active player disconnected; checkpoint recovery required"}, p.id)
 	}
 }
@@ -277,6 +278,12 @@ func (room *relayRoom) restoreSoloV3Locked(p *peer, checkpointTick uint64) error
 	p.lastSequence = 0
 	p.awaitingJoin = false
 	room.electLocked()
+	// The last active player may have left a paused, empty roster behind.
+	// A solo restore is a new baseline at a verified checkpoint, so its
+	// previous departure pause must not trap the new player forever.
+	room.state.recoveryRequired = false
+	room.state.paused = false
+	room.sendToLocked(p.id, serverMessage{Type: "session_resumed", Message: "solo checkpoint restored"})
 	commit := serverMessage{Type: "roster_commit", Generation: room.rosterApplied,
 		Tick: checkpointTick + 1, Players: room.rosterPlayersLocked([]uint64{p.id}),
 		Coordinator: room.state.coordinator}

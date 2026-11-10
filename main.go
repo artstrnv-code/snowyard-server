@@ -304,7 +304,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.5", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.5: no-freeze live join protocol"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.7", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.7: no-freeze live join protocol"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -549,7 +549,7 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		return room.handleRosterJoinReadyV2Locked(p, msg)
 	case "coordinator_resume", "bot_command", "hash_recheck", "recovery_ready":
 		return room.handleSessionLocked(p, msg)
-	case "snapshot_begin", "snapshot_chunk", "snapshot_commit", "snapshot_info", "snapshot_get", "sync_poll", "sync_finish":
+	case "snapshot_begin", "snapshot_chunk", "snapshot_commit", "snapshot_info", "snapshot_get", "sync_poll", "sync_finish", "sync_restart":
 		return r.handleSnapshotLocked(room, p, msg)
 	default:
 		return errors.New("unknown message type")
@@ -675,6 +675,6 @@ func main() {
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.5 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.7 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

@@ -200,6 +200,24 @@ func (r *relay) handleSnapshotLocked(room *relayRoom, p *peer, msg clientMessage
 		}
 	}
 	switch msg.Type {
+	case "sync_restart":
+		// Catch-up can fall behind the bounded lockstep window without the
+		// socket itself failing. Only not-yet-admitted joiners may restart.
+		// Established members must use coordinated room recovery instead.
+		if room.rosterProtocol != rosterProtocolV3 || !p.syncing && !p.awaitingJoin || room.rosterMembers[p.id] {
+			return errors.New("sync restart only permitted for unadmitted v3 peer")
+		}
+		p.syncing = true
+		p.awaitingJoin = false
+		p.replayCursor = 0
+		p.syncID = 0
+		p.chunksSeen = nil
+		// The old checkpoint already failed to provide a usable contiguous
+		// command window. Wait for a *new* checkpoint instead of looping over
+		// the same replay forever.
+		room.sendToLocked(p.id, serverMessage{Type: "sync_wait", Message: "fresh checkpoint required after bounded replay overflow"})
+		room.requestRefreshV3Locked()
+		return nil
 	case "snapshot_begin":
 		if p.id != s.coordinator {
 			return errors.New("snapshot requires coordinator")
