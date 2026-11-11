@@ -3,6 +3,7 @@ package main
 // Snowyard Relay Server 0.3: session and state transport, no world simulation.
 // The Java clients own all simulation, collisions, combat and world state.
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -116,6 +117,7 @@ type peer struct {
 	done            chan struct{}
 	once            sync.Once
 	connectedAt     time.Time
+	onDisconnect    func(string) // Optional observer; invoked once for a terminal disconnect.
 }
 
 func (p *peer) stop() { p.stopWithReason("normal shutdown") }
@@ -124,6 +126,9 @@ func (p *peer) stop() { p.stopWithReason("normal shutdown") }
 // Never log message payloads or player nicknames.
 func (p *peer) stopWithReason(reason string) {
 	p.once.Do(func() {
+		if p.onDisconnect != nil {
+			p.onDisconnect(reason)
+		}
 		mode, roomName := "unassigned", ""
 		if p.room != nil {
 			mode, roomName = p.room.mode, p.room.name
@@ -174,7 +179,51 @@ type relayRoom struct {
 	catchupOwner     uint64
 	catchupWasPaused bool
 }
+
+// Only aggregate failure classes are exposed by /health. Never publish peer
+// identifiers, nicknames, addresses, rooms or individual event timestamps.
+type disconnectCounters struct {
+	total       atomic.Uint64
+	eof         atomic.Uint64
+	writeError  atomic.Uint64
+	pongTimeout atomic.Uint64
+	queueFull   atomic.Uint64
+	readError   atomic.Uint64
+	other       atomic.Uint64
+	lastAtUnix  atomic.Int64
+}
+
+func (c *disconnectCounters) record(reason string) {
+	c.total.Add(1)
+	c.lastAtUnix.Store(time.Now().Unix())
+	switch {
+	case strings.Contains(reason, "outbound queue full"):
+		c.queueFull.Add(1)
+	case strings.HasPrefix(reason, "pong timeout"):
+		c.pongTimeout.Add(1)
+	case strings.HasPrefix(reason, "frame write") || strings.HasPrefix(reason, "ping write"):
+		c.writeError.Add(1)
+	case strings.HasPrefix(reason, "frame read") && strings.Contains(reason, "EOF"):
+		c.eof.Add(1)
+	case strings.HasPrefix(reason, "frame read"):
+		c.readError.Add(1)
+	default:
+		c.other.Add(1)
+	}
+}
+
+func (c *disconnectCounters) snapshot() map[string]uint64 {
+	return map[string]uint64{
+		"total": c.total.Load(), "read_eof": c.eof.Load(),
+		"write_error": c.writeError.Load(), "pong_timeout": c.pongTimeout.Load(),
+		"queue_full": c.queueFull.Load(), "read_error": c.readError.Load(),
+		"other": c.other.Load(),
+	}
+}
+
 type relay struct {
+	disconnects      disconnectCounters
+	startedAt        time.Time
 	mu               sync.Mutex
 	nextID           atomic.Uint64
 	total            atomic.Int64
@@ -221,7 +270,7 @@ func newRelayWithStore(store SnapshotStore) *relay {
 			hashInterval = uint64(n)
 		}
 	}
-	return &relay{rooms: make(map[string]*relayRoom), store: store, snapshotInterval: interval, hashInterval: hashInterval}
+	return &relay{rooms: make(map[string]*relayRoom), store: store, snapshotInterval: interval, hashInterval: hashInterval, startedAt: time.Now()}
 }
 func (r *relay) size() int { return int(r.total.Load()) }
 
@@ -335,7 +384,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.12", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.12: bounded royale transport + disconnect diagnostics"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.14", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.14: bounded royale transport + disconnect diagnostics"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -404,7 +453,7 @@ func (r *relay) remove(p *peer) {
 	delete(room.peers, p.id)
 	if room.royale() && room.state != nil && room.state.royaleLive {
 		if len(room.peers) == 1 {
-			log.Printf("royale_handoff room=%q leaving=%d survivors=1 cause=peer_disconnected", room.name, p.id)
+			log.Printf("royale_handoff_queued room=%q leaving=%d survivors=1 cause=peer_disconnected", room.name, p.id)
 			room.broadcastLocked(serverMessage{Type: "offline_fallback", Mode: room.mode,
 				Room: room.name, BotSlots: room.state.botSlots, Slots: royaleSlots,
 				Message: "only one online player remains; continue locally"}, 0)
@@ -614,6 +663,13 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 			room.appendJournalLocked(serverMessage{Type: "command", PlayerID: p.id, Tick: c.Tick, Sequence: c.Sequence, Payload: c.Payload, Generation: msg.Generation})
 		}
 		room.broadcastLocked(serverMessage{Type: "command_batch", PlayerID: p.id, Commands: msg.Commands, Generation: msg.Generation}, p.id)
+	case "handoff_ack":
+		// Not a condition for local continuation: only an observable receipt.
+		if !room.royale() || room.state == nil || !room.state.royaleLive || len(room.peers) != 1 {
+			return errors.New("handoff acknowledgement outside solo royale")
+		}
+		log.Printf("royale_handoff_applied room=%q player=%d tick=%d", room.name, p.id, p.lastCommandTick)
+		return nil
 	case "leave_request":
 		if !room.persistent() || room.state == nil {
 			room.sendToLocked(p.id, serverMessage{Type: "leave_ready"})
@@ -701,6 +757,7 @@ func writer(p *peer) {
 				return
 			}
 		case wire := <-p.send:
+			isHandoff := bytes.Contains(wire, []byte(`"type":"offline_fallback"`))
 			opcode := byte(1)
 			if p.binary && len(wire) > 0 && wire[0] == serverBatchMarker {
 				opcode = 2
@@ -708,6 +765,13 @@ func writer(p *peer) {
 			if err := p.socket.writeFrame(opcode, wire); err != nil {
 				p.stopWithReason("frame write: " + err.Error())
 				return
+			}
+			if isHandoff {
+				roomName := ""
+				if p.room != nil {
+					roomName = p.room.name
+				}
+				log.Printf("royale_handoff_sent room=%q player=%d", roomName, p.id)
 			}
 		}
 	}
@@ -744,7 +808,7 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"Snowyard SYB2 client update required"}`))
 		return
 	}
-	p := &peer{id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, binary: hello.Binary, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{}), connectedAt: time.Now()}
+	p := &peer{onDisconnect: r.disconnects.record, id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, binary: hello.Binary, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{}), connectedAt: time.Now()}
 	mode, roomName, err := resolveRoom(hello.Mode, hello.Room)
 	if err == nil {
 		err = r.add(p, mode, roomName)
@@ -797,10 +861,19 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.12\",\"players\":%d}", protocolVersion, hub.size())
+		w.Header().Set("Cache-Control", "no-store")
+		// Aggregate only: suitable for public health checks when the dashboard
+		// is unreachable. Counters reset when the Render process restarts.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok", "version": protocolVersion,
+			"serverVersion": "0.3.14", "players": hub.size(),
+			"disconnects":        hub.disconnects.snapshot(),
+			"lastDisconnectUnix": hub.disconnects.lastAtUnix.Load(),
+			"uptimeSeconds":      int64(time.Since(hub.startedAt).Seconds()),
+		})
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.12 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.14 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

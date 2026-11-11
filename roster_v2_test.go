@@ -444,7 +444,7 @@ func TestV2WelcomeIdentifiesServerBuild(t *testing.T) {
 	for _, msg := range msgs {
 		if msg.Type == "welcome" {
 			found = true
-			if msg.ServerVersion != "0.3.12" {
+			if msg.ServerVersion != "0.3.14" {
 				t.Fatalf("wrong build: %q", msg.ServerVersion)
 			}
 		}
