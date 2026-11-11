@@ -140,6 +140,12 @@ func TestRoyaleRosterBarrierAtStart(t *testing.T) {
 		t.Fatal("BR roster activated before start")
 	}
 	r.startRoyale(a.room)
+	if a.room.barrier != nil {
+		t.Fatal("roster activated during countdown")
+	}
+	a.room.mu.Lock()
+	a.room.finishRoyaleStartLocked()
+	a.room.mu.Unlock()
 	g := a.room.barrier.generation
 	if a.room.state.botSlots != 8 {
 		t.Fatal("missing bot slots")

@@ -87,8 +87,17 @@ func TestRoyaleTimeoutAllocatesBots(t *testing.T) {
 	if a.room.state.botSlots != 8 {
 		t.Fatalf("expected 8 bot slots, got %d", a.room.state.botSlots)
 	}
+	if !containsType(drain(a), "match_countdown") {
+		t.Fatal("no countdown event")
+	}
+	if err := r.handle(a, clientMessage{Type: "bot_command", BotID: 1, Tick: 1, Payload: json.RawMessage(`{"left":true}`)}); err == nil {
+		t.Fatal("bot inputs accepted before countdown finished")
+	}
+	a.room.mu.Lock()
+	a.room.finishRoyaleStartLocked()
+	a.room.mu.Unlock()
 	if !containsType(drain(a), "match_started") {
-		t.Fatal("no match_started event")
+		t.Fatal("no match_started event after countdown")
 	}
 	if err := r.handle(a, clientMessage{Type: "bot_command", BotID: 1, Tick: 1, Payload: json.RawMessage(`{"left":true}`)}); err != nil {
 		t.Fatal(err)
@@ -281,6 +290,102 @@ func TestBatchCommandsValidAndAtomic(t *testing.T) {
 	batch.Commands[1].Sequence = 0
 	if err := r.handle(a, batch); err == nil {
 		t.Fatal("non-monotonic batch accepted")
+	}
+	r.remove(a)
+	r.remove(b)
+}
+
+// Royale prototype: the solo path must not waste any ongoing relay traffic.
+func TestRoyaleSoloOfflineFallback(t *testing.T) {
+	r := newRelayWithStore(&mockStore{})
+	solo := peerFor(t, r, "battle_royale", "auto")
+	drain(solo)
+	r.startRoyale(solo.room) // simulate the 90s timer
+	msgs := drain(solo)
+	if !containsType(msgs, "offline_fallback") || containsType(msgs, "match_started") || containsType(msgs, "match_countdown") {
+		t.Fatalf("solo was not switched to local play: %+v", msgs)
+	}
+	if !solo.room.state.started || solo.room.state.royaleLive {
+		t.Fatal("solo room not locked or accidentally live")
+	}
+	next := peerFor(t, r, "battle_royale", "auto")
+	if next.room == solo.room {
+		t.Fatal("another player joined offline-fallback room")
+	}
+	r.remove(solo)
+	r.remove(next)
+}
+
+func TestRoyaleCountdownClosesMatchmaking(t *testing.T) {
+	r := newRelayWithStore(&mockStore{})
+	a := peerFor(t, r, "battle_royale", "auto")
+	b := peerFor(t, r, "battle_royale", "auto")
+	drain(a)
+	drain(b)
+	r.startRoyale(a.room)
+	a.room.mu.Lock()
+	if !a.room.state.started || a.room.state.royaleLive || a.room.state.botSlots != 8 {
+		t.Fatal("bad countdown state")
+	}
+	a.room.mu.Unlock()
+	if !containsType(drain(a), "match_countdown") {
+		t.Fatal("missing countdown")
+	}
+	c := peerFor(t, r, "battle_royale", "auto")
+	if c.room == a.room {
+		t.Fatal("joined room during countdown")
+	}
+	a.room.mu.Lock()
+	a.room.finishRoyaleStartLocked()
+	a.room.mu.Unlock()
+	if !containsType(drain(b), "match_started") {
+		t.Fatal("missing start after countdown")
+	}
+	for _, p := range []*peer{a, b, c} {
+		r.remove(p)
+	}
+}
+
+func TestRoyaleDepartureDuringCountdownFallback(t *testing.T) {
+	r := newRelayWithStore(&mockStore{})
+	a := peerFor(t, r, "battle_royale", "auto")
+	b := peerFor(t, r, "battle_royale", "auto")
+	r.startRoyale(a.room)
+	drain(a)
+	drain(b)
+	r.remove(a)
+	if !containsType(drain(b), "offline_fallback") {
+		t.Fatal("remaining player stranded in countdown")
+	}
+	r.remove(b)
+}
+
+func TestRoyaleRecountsBotsAfterCountdownDeparture(t *testing.T) {
+	r := newRelayWithStore(&mockStore{})
+	a := peerFor(t, r, "battle_royale", "auto")
+	b := peerFor(t, r, "battle_royale", "auto")
+	c := peerFor(t, r, "battle_royale", "auto")
+	r.startRoyale(a.room)
+	drain(a)
+	drain(b)
+	drain(c)
+	r.remove(c)
+	a.room.mu.Lock()
+	a.room.finishRoyaleStartLocked()
+	count := a.room.state.botSlots
+	a.room.mu.Unlock()
+	if count != 8 {
+		t.Fatalf("expected 8 bots after departure, got %d", count)
+	}
+	msgs := drain(a)
+	found := false
+	for _, m := range msgs {
+		if m.Type == "match_started" && m.BotSlots == 8 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected corrected bot count in match_started: %+v", msgs)
 	}
 	r.remove(a)
 	r.remove(b)

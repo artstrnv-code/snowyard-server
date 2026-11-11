@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	royaleSlots = 10
-	royaleWait  = 120 * time.Second
+	royaleSlots     = 10
+	royaleWait      = 90 * time.Second
+	royaleCountdown = 8 * time.Second
 )
 
 type sessionState struct {
@@ -25,6 +26,7 @@ type sessionState struct {
 	timer       *time.Timer
 	saveTimer   *time.Timer
 	botSlots    int
+	royaleLive  bool // matchmaking has ended and the 8-second countdown has elapsed
 	// Two phases: first disagreement requests a recheck, second pauses.
 	hashVotes    map[uint64]map[uint64]string
 	recheckVotes map[uint64]map[uint64]string
@@ -119,9 +121,12 @@ func (r *relay) startRoyale(room *relayRoom) {
 	}
 	room.startRoyaleLocked()
 }
+
+// The countdown closes matchmaking immediately. Match simulation is authorized
+// only after the countdown expires; no timer runs inside the world simulation.
 func (room *relayRoom) startRoyaleLocked() {
 	s := room.state
-	if s == nil || s.started {
+	if s == nil || s.started || len(room.peers) == 0 {
 		return
 	}
 	s.started = true
@@ -133,8 +138,45 @@ func (room *relayRoom) startRoyaleLocked() {
 	if s.botSlots < 0 {
 		s.botSlots = 0
 	}
-	// Bot slots are reserved IDs, not server-side bot simulation.
-	room.broadcastLocked(serverMessage{Type: "match_started", Mode: room.mode, Room: room.name, Coordinator: s.coordinator, Backup: s.backup, BotSlots: s.botSlots, Slots: royaleSlots}, 0)
+	// A solo participant can play the already existing offline mode.
+	// No continuous gameplay stream is required; the client closes the socket
+	// after acknowledging the instruction. The room stays locked meanwhile.
+	if len(room.peers) == 1 {
+		for id := range room.peers {
+			room.sendToLocked(id, serverMessage{Type: "offline_fallback", Mode: room.mode,
+				Room: room.name, BotSlots: s.botSlots, Slots: royaleSlots,
+				Message: "only one human joined; start local Battle Royale"})
+		}
+		return
+	}
+	room.broadcastLocked(serverMessage{Type: "match_countdown", Mode: room.mode,
+		Room: room.name, Coordinator: s.coordinator, Backup: s.backup,
+		BotSlots: s.botSlots, Slots: royaleSlots, DurationSeconds: 8}, 0)
+	s.timer = time.AfterFunc(royaleCountdown, func() {
+		room.mu.Lock()
+		defer room.mu.Unlock()
+		// Cancelled / emptied matches must never send a late start event.
+		if room.state != s || !s.started || s.royaleLive || len(room.peers) == 0 {
+			return
+		}
+		room.finishRoyaleStartLocked()
+	})
+}
+
+// Under room.mu; intentionally separate so unit tests can trigger the deadline
+// without sleeping eight real seconds.
+func (room *relayRoom) finishRoyaleStartLocked() {
+	s := room.state
+	if s == nil || !s.started || s.royaleLive || len(room.peers) < 2 {
+		return
+	}
+	s.royaleLive = true
+	s.timer = nil
+	// Players can leave during countdown; refill their slots with bots.
+	s.botSlots = royaleSlots - len(room.peers)
+	room.broadcastLocked(serverMessage{Type: "match_started", Mode: room.mode,
+		Room: room.name, Coordinator: s.coordinator, Backup: s.backup,
+		BotSlots: s.botSlots, Slots: royaleSlots}, 0)
 	if room.rosterEnabled {
 		room.beginRosterLocked()
 	}
@@ -188,7 +230,7 @@ func (room *relayRoom) handleSessionLocked(p *peer, msg clientMessage) error {
 		if room.rosterEnabled && msg.Generation != room.rosterApplied {
 			return errors.New("bot command roster generation mismatch")
 		}
-		if !room.royale() || !s.started || s.paused || !room.isActiveLocked(p) || p.id != s.coordinator {
+		if !room.royale() || !s.royaleLive || s.paused || !room.isActiveLocked(p) || p.id != s.coordinator {
 			return errors.New("bot command not authorized")
 		}
 		if msg.BotID == 0 || msg.BotID > uint64(s.botSlots) || msg.Tick == 0 || (room.rosterEnabled && msg.Tick < room.rosterStartTick) || len(msg.Payload) == 0 || len(msg.Payload) > maxPayloadBytes || !jsonValid(msg.Payload) {
