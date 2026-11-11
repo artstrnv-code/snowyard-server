@@ -132,8 +132,12 @@ func (p *peer) stopWithReason(reason string) {
 		if !p.connectedAt.IsZero() {
 			duration = time.Since(p.connectedAt).Truncate(time.Second)
 		}
-		log.Printf("peer_disconnected id=%d mode=%s room=%q cause=%q outbound=%d/%d duration=%s",
-			p.id, mode, roomName, reason, len(p.send), cap(p.send), duration)
+		transport := "no_socket"
+		if p.socket != nil {
+			transport = p.socket.healthSummary(time.Now())
+		}
+		log.Printf("peer_disconnected id=%d mode=%s room=%q cause=%q outbound=%d/%d duration=%s %s",
+			p.id, mode, roomName, reason, len(p.send), cap(p.send), duration, transport)
 		if p.done != nil {
 			close(p.done)
 		}
@@ -331,7 +335,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.11", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.11: bounded royale transport + disconnect diagnostics"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.12", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.12: bounded royale transport + disconnect diagnostics"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -400,6 +404,7 @@ func (r *relay) remove(p *peer) {
 	delete(room.peers, p.id)
 	if room.royale() && room.state != nil && room.state.royaleLive {
 		if len(room.peers) == 1 {
+			log.Printf("royale_handoff room=%q leaving=%d survivors=1 cause=peer_disconnected", room.name, p.id)
 			room.broadcastLocked(serverMessage{Type: "offline_fallback", Mode: room.mode,
 				Room: room.name, BotSlots: room.state.botSlots, Slots: royaleSlots,
 				Message: "only one online player remains; continue locally"}, 0)
@@ -679,14 +684,19 @@ func isHex(s string) bool {
 
 func writer(p *peer) {
 	defer p.stop()
-	heartbeat := time.NewTicker(25 * time.Second)
+	heartbeat := time.NewTicker(10 * time.Second)
 	defer heartbeat.Stop()
 	for {
 		select {
 		case <-p.done:
 			return
 		case <-heartbeat.C:
-			if err := p.socket.writeFrame(0x9, nil); err != nil {
+			// Existing probes stay outstanding until an exact matching Pong.
+			if sent := p.socket.pendingPingNs.Load(); sent != 0 && time.Since(time.Unix(0, sent)) > 50*time.Second {
+				p.stopWithReason("pong timeout: " + p.socket.healthSummary(time.Now()))
+				return
+			}
+			if err := p.socket.sendHeartbeat(); err != nil {
 				p.stopWithReason("ping write: " + err.Error())
 				return
 			}
@@ -771,6 +781,7 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 	}
 }
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "10000"
@@ -786,10 +797,10 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.11\",\"players\":%d}", protocolVersion, hub.size())
+		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.12\",\"players\":%d}", protocolVersion, hub.size())
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.11 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.12 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

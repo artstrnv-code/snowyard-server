@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,9 +25,14 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 var errWSClosed = errors.New("websocket closed")
 
 type wsConn struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	mu     sync.Mutex // Only one writer may use the connection at a time.
+	conn          net.Conn
+	reader        *bufio.Reader
+	mu            sync.Mutex // Only one writer may use the connection at a time.
+	lastReadNs    atomic.Int64
+	lastWriteNs   atomic.Int64
+	lastPongNs    atomic.Int64
+	pendingPingNs atomic.Int64
+	pingRTTMs     atomic.Int64
 }
 
 func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
@@ -64,7 +70,13 @@ func upgradeWebSocket(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
 		_ = c.Close()
 		return nil, err
 	}
-	return &wsConn{conn: c, reader: buf.Reader}, nil
+	socket := &wsConn{conn: c, reader: buf.Reader}
+	now := time.Now().UnixNano()
+	socket.lastReadNs.Store(now)
+	socket.lastWriteNs.Store(now)
+	socket.lastPongNs.Store(now)
+	socket.pingRTTMs.Store(-1)
+	return socket, nil
 }
 
 func sameOrigin(origin, host string) bool {
@@ -139,9 +151,10 @@ func (w *wsConn) readMessageWithTimeout(timeout time.Duration) ([]byte, error) {
 		for i := range payload {
 			payload[i] ^= mask[i%4]
 		}
+		w.lastReadNs.Store(time.Now().UnixNano())
 		switch op {
 		case 0x8:
-			_ = w.writeFrame(0x8, nil)
+			_ = w.writeFrame(0x8, payload)
 			return nil, errWSClosed
 		case 0x9:
 			if err := w.writeFrame(0xA, payload); err != nil {
@@ -149,6 +162,16 @@ func (w *wsConn) readMessageWithTimeout(timeout time.Duration) ([]byte, error) {
 			}
 			continue
 		case 0xA:
+			// Pong echoes our exact 8-byte timestamp. A delayed response to
+			// an older ping must not acknowledge a newer outstanding ping.
+			if len(payload) == 8 {
+				sent := int64(binary.BigEndian.Uint64(payload))
+				if sent > 0 && w.pendingPingNs.CompareAndSwap(sent, 0) {
+					now := time.Now().UnixNano()
+					w.lastPongNs.Store(now)
+					w.pingRTTMs.Store((now - sent) / int64(time.Millisecond))
+				}
+			}
 			continue
 		case 0x1, 0x2:
 			if fragmented {
@@ -200,6 +223,35 @@ func (w *wsConn) writeFrame(op byte, data []byte) error {
 		}
 		frame = frame[n:]
 	}
+	w.lastWriteNs.Store(time.Now().UnixNano())
 	return nil
 }
+
+// Issue a single probe only when no earlier Ping is outstanding.
+func (w *wsConn) sendHeartbeat() error {
+	sent := time.Now().UnixNano()
+	if !w.pendingPingNs.CompareAndSwap(0, sent) {
+		return nil
+	}
+	var payload [8]byte
+	binary.BigEndian.PutUint64(payload[:], uint64(sent))
+	if err := w.writeFrame(0x9, payload[:]); err != nil {
+		w.pendingPingNs.CompareAndSwap(sent, 0)
+		return err
+	}
+	return nil
+}
+func (w *wsConn) healthSummary(now time.Time) string {
+	age := func(ns int64) int64 {
+		if ns <= 0 {
+			return -1
+		}
+		return (now.UnixNano() - ns) / int64(time.Millisecond)
+	}
+	return fmt.Sprintf("rxAgeMs=%d txAgeMs=%d pongAgeMs=%d pingOutstandingMs=%d rttMs=%d",
+		age(w.lastReadNs.Load()), age(w.lastWriteNs.Load()), age(w.lastPongNs.Load()),
+		age(w.pendingPingNs.Load()), w.pingRTTMs.Load())
+}
+
+// A normal WebSocket close frame is best effort; broken connections are closed directly.
 func (w *wsConn) close() { _ = w.conn.Close() }
