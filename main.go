@@ -115,9 +115,33 @@ type peer struct {
 	backupDownload  bool
 	done            chan struct{}
 	once            sync.Once
+	connectedAt     time.Time
 }
 
-func (p *peer) stop() { p.once.Do(func() { close(p.done); p.socket.close() }) }
+func (p *peer) stop() { p.stopWithReason("normal shutdown") }
+
+// Log the first terminal cause while the peer still has its room metadata.
+// Never log message payloads or player nicknames.
+func (p *peer) stopWithReason(reason string) {
+	p.once.Do(func() {
+		mode, roomName := "unassigned", ""
+		if p.room != nil {
+			mode, roomName = p.room.mode, p.room.name
+		}
+		duration := time.Duration(0)
+		if !p.connectedAt.IsZero() {
+			duration = time.Since(p.connectedAt).Truncate(time.Second)
+		}
+		log.Printf("peer_disconnected id=%d mode=%s room=%q cause=%q outbound=%d/%d duration=%s",
+			p.id, mode, roomName, reason, len(p.send), cap(p.send), duration)
+		if p.done != nil {
+			close(p.done)
+		}
+		if p.socket != nil {
+			p.socket.close()
+		}
+	})
+}
 
 // Rooms are isolated. A room owns its membership, ordering and transient hashes.
 // The hub mutex protects only room registration: gameplay never takes it.
@@ -307,7 +331,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.10", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.10: royale lockstep + departure"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.11", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.11: bounded royale transport + disconnect diagnostics"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -491,7 +515,7 @@ func (room *relayRoom) broadcastLocked(msg serverMessage, exclude uint64) {
 			return wire
 		}():
 		default:
-			go p.stop()
+			go p.stopWithReason("outbound queue full during broadcast")
 		}
 	}
 }
@@ -663,6 +687,7 @@ func writer(p *peer) {
 			return
 		case <-heartbeat.C:
 			if err := p.socket.writeFrame(0x9, nil); err != nil {
+				p.stopWithReason("ping write: " + err.Error())
 				return
 			}
 		case wire := <-p.send:
@@ -671,6 +696,7 @@ func writer(p *peer) {
 				opcode = 2
 			}
 			if err := p.socket.writeFrame(opcode, wire); err != nil {
+				p.stopWithReason("frame write: " + err.Error())
 				return
 			}
 		}
@@ -681,7 +707,7 @@ func sendControl(p *peer, msg serverMessage) {
 	select {
 	case p.send <- wire:
 	default:
-		p.stop()
+		p.stopWithReason("outbound queue full during control message")
 	}
 }
 func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
@@ -708,7 +734,7 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"Snowyard SYB2 client update required"}`))
 		return
 	}
-	p := &peer{id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, binary: hello.Binary, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{})}
+	p := &peer{id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, binary: hello.Binary, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{}), connectedAt: time.Now()}
 	mode, roomName, err := resolveRoom(hello.Mode, hello.Room)
 	if err == nil {
 		err = r.add(p, mode, roomName)
@@ -717,11 +743,12 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"invalid or full room"}`))
 		return
 	}
-	defer func() { r.remove(p); p.stop() }()
+	defer func() { p.stop(); r.remove(p) }()
 	go writer(p)
 	for {
 		message, err := socket.readMessage()
 		if err != nil {
+			p.stopWithReason("frame read: " + err.Error())
 			return
 		}
 		var cmd clientMessage
@@ -759,10 +786,10 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.5\",\"players\":%d}", protocolVersion, hub.size())
+		_, _ = fmt.Fprintf(w, "{\"status\":\"ok\",\"version\":%d,\"serverVersion\":\"0.3.11\",\"players\":%d}", protocolVersion, hub.size())
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.10 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.11 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }
