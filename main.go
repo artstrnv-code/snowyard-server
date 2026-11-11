@@ -76,6 +76,7 @@ type serverMessage struct {
 	Coordinator     uint64           `json:"coordinator,omitempty"`
 	Backup          uint64           `json:"backup,omitempty"`
 	Paused          bool             `json:"paused,omitempty"`
+	LastCommandTick uint64           `json:"lastCommandTick,omitempty"`
 	BotSlots        int              `json:"botSlots,omitempty"`
 	DurationSeconds int              `json:"durationSeconds,omitempty"`
 	Slots           int              `json:"slots,omitempty"`
@@ -306,7 +307,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.9", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.9: royale lobby prototype + departure sync"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.10", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.10: royale lockstep + departure"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -373,6 +374,26 @@ func (r *relay) remove(p *peer) {
 		}
 	}
 	delete(room.peers, p.id)
+	if room.royale() && room.state != nil && room.state.royaleLive {
+		if len(room.peers) == 1 {
+			room.broadcastLocked(serverMessage{Type: "offline_fallback", Mode: room.mode,
+				Room: room.name, BotSlots: room.state.botSlots, Slots: royaleSlots,
+				Message: "only one online player remains; continue locally"}, 0)
+		} else if len(room.peers) > 1 {
+			// Everyone knows the departed peer's last accepted tick. Supply
+			// synthetic no-input frames until a shared future removal tick.
+			// A 12-tick lead tolerates messages already in flight.
+			cutover := p.lastCommandTick
+			for _, survivor := range room.peers {
+				if survivor.lastCommandTick > cutover {
+					cutover = survivor.lastCommandTick
+				}
+			}
+			cutover += 12
+			room.broadcastLocked(serverMessage{Type: "royale_departure", PlayerID: p.id,
+				Tick: cutover, LastCommandTick: p.lastCommandTick}, 0)
+		}
+	}
 	if room.royale() && room.state != nil && room.state.started && !room.state.royaleLive && len(room.peers) == 1 {
 		// A late departure during countdown leaves one human. Cancel the
 		// countdown rather than trapping the survivor in a locked room.
@@ -486,6 +507,9 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 	}
 	switch msg.Type {
 	case "command":
+		if room.royale() && (room.state == nil || !room.state.royaleLive) {
+			return errors.New("Battle Royale is not live")
+		}
 		if room.v3DepartureTick != 0 && msg.Generation == room.v3PriorGeneration &&
 			msg.Tick <= p.lastCommandTick {
 			// This was already accepted before the departure; the re-sent
@@ -515,6 +539,9 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		room.appendJournalLocked(cmd)
 		room.broadcastLocked(cmd, p.id)
 	case "command_batch":
+		if room.royale() && (room.state == nil || !room.state.royaleLive) {
+			return errors.New("Battle Royale is not live")
+		}
 		if room.rosterProtocol == rosterProtocolV3 && room.v3DepartureTick != 0 &&
 			msg.Generation == room.v3PriorGeneration {
 			// A batch sent just before departure may straddle the cutover.
@@ -736,6 +763,6 @@ func main() {
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.9 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.10 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

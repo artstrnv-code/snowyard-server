@@ -99,7 +99,12 @@ func (room *relayRoom) electLocked() {
 		}
 	}
 	if prev != s.coordinator || oldBackup != s.backup {
-		if prev != 0 && prev != s.coordinator && room.rosterProtocol != rosterProtocolV3 {
+		if room.royale() && prev != s.coordinator {
+			// New AI authority may still be behind its predecessor's last
+			// submitted plan. Do not reject its deterministic takeover.
+			s.botTicks = make(map[uint64]uint64)
+		}
+		if prev != 0 && prev != s.coordinator && room.rosterProtocol != rosterProtocolV3 && !room.royale() {
 			s.paused = true
 		}
 		// A roster-v3 departure has its own deterministic generation change.
@@ -176,7 +181,8 @@ func (room *relayRoom) finishRoyaleStartLocked() {
 	s.botSlots = royaleSlots - len(room.peers)
 	room.broadcastLocked(serverMessage{Type: "match_started", Mode: room.mode,
 		Room: room.name, Coordinator: s.coordinator, Backup: s.backup,
-		BotSlots: s.botSlots, Slots: royaleSlots}, 0)
+		BotSlots: s.botSlots, Slots: royaleSlots,
+		Players: room.rosterPlayersLocked(room.orderedPlayersLocked())}, 0)
 	if room.rosterEnabled {
 		room.beginRosterLocked()
 	}
