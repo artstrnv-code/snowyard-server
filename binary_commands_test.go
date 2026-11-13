@@ -47,3 +47,27 @@ func TestSYB2RejectsMalformed(t *testing.T) {
 		}
 	}
 }
+
+// SYB3 travels through the relay unchanged, including its compact throw body.
+func TestSYB3BatchBridge(t *testing.T) {
+	sample := []byte{0xB5, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	var wire bytes.Buffer
+	wire.WriteByte(clientBatchMarker)
+	putVar(&wire, 2)
+	wire.WriteByte(1)
+	putVar(&wire, 17)
+	putVar(&wire, 42)
+	putVar(&wire, uint64(len(sample)))
+	wire.Write(sample)
+	msg, err := decodeClientBatch(wire.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := encodeServerBatch(serverMessage{Type: "command_batch", PlayerID: 1, Generation: msg.Generation, Commands: msg.Commands})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(back[len(back)-len(sample):], sample) {
+		t.Fatal("SYB3 payload changed during relay")
+	}
+}

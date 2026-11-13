@@ -384,7 +384,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.14", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.14: bounded royale transport + disconnect diagnostics"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.15", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.15: bounded royale transport + disconnect diagnostics"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -805,7 +805,7 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if hello.RosterVersion == rosterProtocolV3 && !hello.Binary {
-		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"Snowyard SYB2 client update required"}`))
+		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"Snowyard SYB3 client update required"}`))
 		return
 	}
 	p := &peer{onDisconnect: r.disconnects.record, id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, binary: hello.Binary, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{}), connectedAt: time.Now()}
@@ -866,7 +866,7 @@ func main() {
 		// is unreachable. Counters reset when the Render process restarts.
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok", "version": protocolVersion,
-			"serverVersion": "0.3.14", "players": hub.size(),
+			"serverVersion": "0.3.15", "players": hub.size(),
 			"disconnects":        hub.disconnects.snapshot(),
 			"lastDisconnectUnix": hub.disconnects.lastAtUnix.Load(),
 			"uptimeSeconds":      int64(time.Since(hub.startedAt).Seconds()),
@@ -874,6 +874,6 @@ func main() {
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.14 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.15 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

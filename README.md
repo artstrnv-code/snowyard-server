@@ -88,3 +88,6 @@ See `PROTOCOL_034.md` and `RELEASE_NOTES_034.md`. Java Snowyard 0.12i required f
 ## v0.3.4a
 
 Correct /health version and explicit WebSocket welcome version; cancelled roster transactions resume established players. See RELEASE_NOTES_034a.md.
+
+
+Go Relay **0.3.15** accepts SYB3 (`0xB5`) compact tick packets; use with Just a Snow Game **0.15.21**. Live throw payload: 16-bit azimuth + 16-bit range. Client refuses other relay versions. Deploy relay before the client.

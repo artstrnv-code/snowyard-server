@@ -1,6 +1,6 @@
 package main
 
-// SYB2 binary WebSocket envelope. The relay validates the tick envelope but
+// SYB3/SYB2 binary WebSocket envelope. The relay validates the tick envelope but
 // deliberately never simulates or re-encodes a client's deterministic input.
 // The journal remains JSON-compatible for checkpoint replay.
 import (
@@ -62,7 +62,7 @@ func decodeClientBatch(data []byte) (clientMessage, error) {
 		if _, e = r.Read(payload); e != nil {
 			return bad, e
 		}
-		if payload[0] != 0xB2 && !(len(payload) >= 4 && bytes.Equal(payload[:4], []byte("SYJ1"))) {
+		if payload[0] != 0xB5 && payload[0] != 0xB2 && !(len(payload) >= 4 && bytes.Equal(payload[:4], []byte("SYJ1"))) {
 			return bad, errors.New("invalid tick encoding")
 		}
 		body, err := json.Marshal(struct {
