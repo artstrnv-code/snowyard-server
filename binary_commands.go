@@ -58,20 +58,17 @@ func decodeClientBatch(data []byte) (clientMessage, error) {
 		if size == 0 || size > 6144 || uint64(r.Len()) < size {
 			return bad, errors.New("invalid binary tick size")
 		}
-		payload := make([]byte, int(size))
-		if _, e = r.Read(payload); e != nil {
+		// Reader.Bytes are backed by this WebSocket frame; keep a slice instead
+		// of copying and converting every binary input into JSON/Base64.
+		start := len(data) - r.Len()
+		payload := data[start : start+int(size)]
+		if _, e = r.Seek(int64(size), 1); e != nil {
 			return bad, e
 		}
 		if payload[0] != 0xB5 && payload[0] != 0xB2 && !(len(payload) >= 4 && bytes.Equal(payload[:4], []byte("SYJ1"))) {
 			return bad, errors.New("invalid tick encoding")
 		}
-		body, err := json.Marshal(struct {
-			B string `json:"b"`
-		}{base64.StdEncoding.EncodeToString(payload)})
-		if err != nil {
-			return bad, err
-		}
-		msg.Commands = append(msg.Commands, batchedCommand{Tick: tick, Sequence: seq, Payload: body})
+		msg.Commands = append(msg.Commands, batchedCommand{Tick: tick, Sequence: seq, BinaryPayload: payload})
 	}
 	if r.Len() != 0 {
 		return bad, errors.New("trailing binary command data")
@@ -88,15 +85,20 @@ func encodeServerBatch(msg serverMessage) ([]byte, error) {
 	putVar(&out, msg.Generation)
 	out.WriteByte(byte(len(msg.Commands)))
 	for _, c := range msg.Commands {
-		var p struct {
-			B string `json:"b"`
-		}
-		if err := json.Unmarshal(c.Payload, &p); err != nil {
-			return nil, err
-		}
-		data, err := base64.StdEncoding.DecodeString(p.B)
-		if err != nil {
-			return nil, err
+		data := c.BinaryPayload
+		if len(data) == 0 {
+			// Historical JSON command batches remain readable.
+			var p struct {
+				B string `json:"b"`
+			}
+			if err := json.Unmarshal(c.Payload, &p); err != nil {
+				return nil, err
+			}
+			var err error
+			data, err = base64.StdEncoding.DecodeString(p.B)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if len(data) == 0 || len(data) > 6144 {
 			return nil, fmt.Errorf("invalid compact input length: %d", len(data))
@@ -107,4 +109,14 @@ func encodeServerBatch(msg serverMessage) ([]byte, error) {
 		out.Write(data)
 	}
 	return out.Bytes(), nil
+}
+
+// wrapBinaryCommand produces the historical replay representation only when
+// a persistent journal or a text-mode peer actually requires JSON.
+func wrapBinaryCommand(payload []byte) json.RawMessage {
+	encoded := base64.StdEncoding.EncodeToString(payload)
+	out, _ := json.Marshal(struct {
+		B string `json:"b"`
+	}{encoded})
+	return out
 }

@@ -27,11 +27,15 @@ func TestSYB2BatchBridge(t *testing.T) {
 	if err != nil || outbound[0] != serverBatchMarker {
 		t.Fatalf("encode: %v", err)
 	}
-	// Verify the commands survived the JSON replay bridge without changing bytes.
+	// The hot path must keep bytes intact without allocating JSON/Base64.
+	if len(msg.Commands[0].Payload) != 0 || !bytes.Equal(msg.Commands[0].BinaryPayload, sample) {
+		t.Fatal("binary input was converted or corrupted")
+	}
+	// Replay compatibility remains available on demand.
 	var parsed struct {
 		B string `json:"b"`
 	}
-	if err := json.Unmarshal(msg.Commands[0].Payload, &parsed); err != nil {
+	if err := json.Unmarshal(wrapBinaryCommand(msg.Commands[0].BinaryPayload), &parsed); err != nil {
 		t.Fatal(err)
 	}
 	recovered, err := base64.StdEncoding.DecodeString(parsed.B)

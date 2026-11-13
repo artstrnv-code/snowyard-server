@@ -26,9 +26,10 @@ const maxOutboundQueue = 256
 const maxRooms = 256
 
 type batchedCommand struct {
-	Tick     uint64          `json:"tick"`
-	Sequence uint64          `json:"sequence"`
-	Payload  json.RawMessage `json:"payload"`
+	Tick          uint64          `json:"tick"`
+	Sequence      uint64          `json:"sequence"`
+	Payload       json.RawMessage `json:"payload"`
+	BinaryPayload []byte          `json:"-"` // Wire body; materialize JSON only for replay or text peers.
 }
 
 type clientMessage struct {
@@ -104,6 +105,7 @@ type peer struct {
 	room            *relayRoom
 	rosterVersion   int
 	binary          bool
+	traffic         *trafficCounters // Shared aggregate; no player-identifying metrics.
 	lastCommandTick uint64
 	lastSequence    uint64
 	lastHashTick    uint64
@@ -178,10 +180,23 @@ type relayRoom struct {
 	// Freeze normal commands only at the final catch-up batch.
 	catchupOwner     uint64
 	catchupWasPaused bool
+	traffic          trafficCounters // Room-local counts; exposed only as anonymous aggregates.
 }
 
 // Only aggregate failure classes are exposed by /health. Never publish peer
 // identifiers, nicknames, addresses, rooms or individual event timestamps.
+// WebSocket application-payload counters; excludes frame headers, TCP, TLS and
+// heartbeat control frames. Atomic updates are safe in writer/read goroutines.
+type trafficCounters struct {
+	inBytes  atomic.Uint64
+	outBytes atomic.Uint64
+	inMsgs   atomic.Uint64
+	outMsgs  atomic.Uint64
+}
+
+func (c *trafficCounters) received(n int) { c.inBytes.Add(uint64(n)); c.inMsgs.Add(1) }
+func (c *trafficCounters) sent(n int)     { c.outBytes.Add(uint64(n)); c.outMsgs.Add(1) }
+
 type disconnectCounters struct {
 	total       atomic.Uint64
 	eof         atomic.Uint64
@@ -223,6 +238,7 @@ func (c *disconnectCounters) snapshot() map[string]uint64 {
 
 type relay struct {
 	disconnects      disconnectCounters
+	traffic          trafficCounters
 	startedAt        time.Time
 	mu               sync.Mutex
 	nextID           atomic.Uint64
@@ -271,6 +287,28 @@ func newRelayWithStore(store SnapshotStore) *relay {
 		}
 	}
 	return &relay{rooms: make(map[string]*relayRoom), store: store, snapshotInterval: interval, hashInterval: hashInterval, startedAt: time.Now()}
+}
+
+// Anonymous traffic statistics for active rooms. Does not lock room.mu and
+// therefore cannot block gameplay. Counters reset when rooms disappear.
+func (r *relay) trafficSnapshot() map[string]uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var rooms, activeIn, activeOut uint64
+	for _, room := range r.rooms {
+		rooms++
+		activeIn += room.traffic.inBytes.Load()
+		activeOut += room.traffic.outBytes.Load()
+	}
+	return map[string]uint64{
+		"inBytes":            r.traffic.inBytes.Load(),
+		"outBytes":           r.traffic.outBytes.Load(),
+		"inMessages":         r.traffic.inMsgs.Load(),
+		"outMessages":        r.traffic.outMsgs.Load(),
+		"activeRooms":        rooms,
+		"activeRoomInBytes":  activeIn,
+		"activeRoomOutBytes": activeOut,
+	}
 }
 func (r *relay) size() int { return int(r.total.Load()) }
 
@@ -384,7 +422,7 @@ func (r *relay) add(p *peer, mode, name string) error {
 	if room.advanced() {
 		checkpoint = room.hashInterval
 	}
-	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.15", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.15: bounded royale transport + disconnect diagnostics"})
+	wire, _ := json.Marshal(serverMessage{Type: "welcome", ServerVersion: "0.3.16", PlayerID: p.id, Version: protocolVersion, Mode: mode, Room: name, Players: roster, HashInterval: checkpoint, RosterVersion: p.rosterVersion, Message: "relay v0.3.16: bounded royale transport + disconnect diagnostics"})
 	p.send <- wire
 	p.room = room
 	if room.persistent() && (room.state.snapshot != nil || len(room.peers) > 0) {
@@ -547,27 +585,54 @@ func (r *relay) remove(p *peer) {
 	room.mu.Unlock()
 	r.mu.Unlock()
 }
+
+// broadcastLocked keeps binary gameplay input binary all the way to binary peers.
+// Text serialization is only performed when at least one text peer needs it.
 func (room *relayRoom) broadcastLocked(msg serverMessage, exclude uint64) {
-	wire, _ := json.Marshal(msg) // One serialization per broadcast, not per player.
-	var binaryWire []byte
-	if msg.Type == "command_batch" {
+	gameplay := msg.Type == "command" || msg.Type == "command_batch" || msg.Type == "hash" || msg.Type == "bot_command"
+	var wantsBinary, wantsText bool
+	for id, p := range room.peers {
+		if id == exclude || (gameplay && p.syncing) {
+			continue
+		}
+		if p.binary && msg.Type == "command_batch" {
+			wantsBinary = true
+		} else {
+			wantsText = true
+		}
+	}
+	if !wantsBinary && !wantsText {
+		return
+	}
+	var binaryWire, wire []byte
+	if wantsBinary {
 		binaryWire, _ = encodeServerBatch(msg)
 	}
-	gameplay := msg.Type == "command" || msg.Type == "command_batch" || msg.Type == "hash" || msg.Type == "bot_command"
+	if wantsText {
+		// Legacy JSON clients need base64-wrapped payloads. No conversion is
+		// performed for binary-only rooms, which are the normal SYB3 case.
+		if msg.Type == "command_batch" {
+			textCommands := make([]batchedCommand, len(msg.Commands))
+			for i, c := range msg.Commands {
+				textCommands[i] = c
+				if len(c.BinaryPayload) != 0 {
+					textCommands[i].Payload = wrapBinaryCommand(c.BinaryPayload)
+				}
+			}
+			msg.Commands = textCommands
+		}
+		wire, _ = json.Marshal(msg)
+	}
 	for id, p := range room.peers {
-		if gameplay && p.syncing {
+		if id == exclude || (gameplay && p.syncing) {
 			continue
 		}
-		if id == exclude {
-			continue
+		packet := wire
+		if p.binary && len(binaryWire) > 0 {
+			packet = binaryWire
 		}
 		select {
-		case p.send <- func() []byte {
-			if p.binary && len(binaryWire) > 0 {
-				return binaryWire
-			}
-			return wire
-		}():
+		case p.send <- packet:
 		default:
 			go p.stopWithReason("outbound queue full during broadcast")
 		}
@@ -652,15 +717,27 @@ func (r *relay) handle(p *peer, msg clientMessage) error {
 		}
 		lastTick, lastSeq := p.lastCommandTick, p.lastSequence
 		for _, c := range msg.Commands {
-			if c.Tick == 0 || (room.rosterEnabled && !room.validInputGenerationLocked(msg.Generation, c.Tick)) || c.Tick < lastTick || (c.Tick == lastTick && c.Sequence <= lastSeq) || len(c.Payload) == 0 || len(c.Payload) > maxPayloadBytes || !json.Valid(c.Payload) {
+			validPayload := len(c.BinaryPayload) > 0 && len(c.BinaryPayload) <= 6144
+			if !validPayload {
+				validPayload = len(c.Payload) > 0 && len(c.Payload) <= maxPayloadBytes && json.Valid(c.Payload)
+			}
+			if c.Tick == 0 || (room.rosterEnabled && !room.validInputGenerationLocked(msg.Generation, c.Tick)) || c.Tick < lastTick || (c.Tick == lastTick && c.Sequence <= lastSeq) || !validPayload {
 				return errors.New("invalid command batch")
 			}
 			lastTick, lastSeq = c.Tick, c.Sequence
 		}
 		room.guardJoinBoundaryV3Locked(lastTick)
 		p.lastCommandTick, p.lastSequence = lastTick, lastSeq
-		for _, c := range msg.Commands {
-			room.appendJournalLocked(serverMessage{Type: "command", PlayerID: p.id, Tick: c.Tick, Sequence: c.Sequence, Payload: c.Payload, Generation: msg.Generation})
+		// Persistent Brawl still needs JSON-compatible journal entries for
+		// snapshots/replay. Non-persistent Royale avoids this conversion.
+		if room.persistent() && room.state != nil {
+			for _, c := range msg.Commands {
+				payload := c.Payload
+				if len(c.BinaryPayload) != 0 {
+					payload = wrapBinaryCommand(c.BinaryPayload)
+				}
+				room.appendJournalLocked(serverMessage{Type: "command", PlayerID: p.id, Tick: c.Tick, Sequence: c.Sequence, Payload: payload, Generation: msg.Generation})
+			}
 		}
 		room.broadcastLocked(serverMessage{Type: "command_batch", PlayerID: p.id, Commands: msg.Commands, Generation: msg.Generation}, p.id)
 	case "handoff_ack":
@@ -766,6 +843,12 @@ func writer(p *peer) {
 				p.stopWithReason("frame write: " + err.Error())
 				return
 			}
+			if p.traffic != nil {
+				p.traffic.sent(len(wire))
+			}
+			if p.room != nil {
+				p.room.traffic.sent(len(wire))
+			}
 			if isHandoff {
 				roomName := ""
 				if p.room != nil {
@@ -808,7 +891,7 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		_ = socket.writeFrame(1, []byte(`{"type":"error","message":"Snowyard SYB3 client update required"}`))
 		return
 	}
-	p := &peer{onDisconnect: r.disconnects.record, id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, binary: hello.Binary, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{}), connectedAt: time.Now()}
+	p := &peer{onDisconnect: r.disconnects.record, traffic: &r.traffic, id: r.nextID.Add(1), nickname: hello.Nickname, rosterVersion: hello.RosterVersion, binary: hello.Binary, socket: socket, send: make(chan []byte, maxOutboundQueue), done: make(chan struct{}), connectedAt: time.Now()}
 	mode, roomName, err := resolveRoom(hello.Mode, hello.Room)
 	if err == nil {
 		err = r.add(p, mode, roomName)
@@ -824,6 +907,10 @@ func (r *relay) websocket(w http.ResponseWriter, req *http.Request) {
 		if err != nil {
 			p.stopWithReason("frame read: " + err.Error())
 			return
+		}
+		r.traffic.received(len(message))
+		if p.room != nil {
+			p.room.traffic.received(len(message))
 		}
 		var cmd clientMessage
 		if len(message) > 0 && message[0] == clientBatchMarker {
@@ -866,14 +953,15 @@ func main() {
 		// is unreachable. Counters reset when the Render process restarts.
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok", "version": protocolVersion,
-			"serverVersion": "0.3.15", "players": hub.size(),
+			"serverVersion": "0.3.16", "players": hub.size(),
 			"disconnects":        hub.disconnects.snapshot(),
+			"traffic":            hub.trafficSnapshot(),
 			"lastDisconnectUnix": hub.disconnects.lastAtUnix.Load(),
 			"uptimeSeconds":      int64(time.Since(hub.startedAt).Seconds()),
 		})
 	})
 	mux.HandleFunc("/ws", hub.websocket)
 	server := &http.Server{Addr: "0.0.0.0:" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second}
-	log.Printf("Snowyard relay v0.3.15 listening on 0.0.0.0:%s", port)
+	log.Printf("Snowyard relay v0.3.16 listening on 0.0.0.0:%s", port)
 	log.Fatal(server.ListenAndServe())
 }

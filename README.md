@@ -1,3 +1,5 @@
+> **Current release: Relay 0.3.16.** SYB3 direct binary transport (compatible with game 0.15.23).
+
 > **Current release: Relay 0.3.5.** For rosterVersion=3 live/no-freeze Brawl joins, see [PROTOCOL_035.md](PROTOCOL_035.md) and [RELEASE_NOTES_035.md](RELEASE_NOTES_035.md). Java 0.13a is required.
 
 # Snowyard Relay Server 0.3.3
@@ -91,3 +93,5 @@ Correct /health version and explicit WebSocket welcome version; cancelled roster
 
 
 Go Relay **0.3.15** accepts SYB3 (`0xB5`) compact tick packets; use with Just a Snow Game **0.15.21**. Live throw payload: 16-bit azimuth + 16-bit range. Client refuses other relay versions. Deploy relay before the client.
+
+Go Relay 0.3.16 avoids binary-to-Base64-to-binary conversions for normal rooms. Base64 remains for persistent recovery journals and legacy text peers. Client 0.15.23 is required because the client checks relay version.
